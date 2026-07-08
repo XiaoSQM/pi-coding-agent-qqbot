@@ -1,0 +1,30 @@
+{
+  "name": "pi-qqbot",
+  "version": "0.1.0",
+  "description": "A Pi extension that connects the official QQ Bot API to a local Pi coding agent.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "qqbot",
+    "qq-bot",
+    "coding-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wunaitianwang/pi-qqbot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wunaitianwang/pi-qqbot/issues"
+  },
+  "homepage": "https://github.com/wunaitianwang/pi-qqbot#readme",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}

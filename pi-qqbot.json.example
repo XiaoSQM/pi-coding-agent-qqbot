@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "appId": "YOUR_QQBOT_APP_ID",
+  "clientSecret": "YOUR_QQBOT_APP_SECRET",
+  "sandbox": true,
+  "allowUsers": [],
+  "allowGroups": [],
+  "replyPrefix": "",
+  "maxQueueSize": 20,
+  "sendBusyNotice": false,
+  "allowCommands": false,
+  "showProcess": false,
+  "debug": false
+}
