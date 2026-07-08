@@ -3,13 +3,15 @@
  *
  * Lifecycle:
  *  - Commands are registered immediately (in the factory).
- *  - The QQ runtime (sockets/timers) starts in session_start and is torn down
- *    in session_shutdown, per the Pi extension guidelines.
+ *  - The QQ runtime (sockets/timers + an ISOLATED agent session) starts in
+ *    session_start and is torn down in session_shutdown.
+ *
+ * Isolation: QQ messages are handled by a separate SDK-created AgentSession, so
+ * they never touch the local user's TUI session. See router.ts / qq-session.ts.
  *
  * Security: QQ turns a local coding agent into a remote control surface. The
  * runtime defaults to disabled with empty allowlists; empty allowlists mean no
- * inbound message is processed. QQ messages are injected into the SAME Pi
- * session the local user drives — see README.
+ * inbound message is processed.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -88,22 +90,6 @@ export default function (pi: ExtensionAPI) {
 
 		runtime = new PiQQBotRuntime(pi, config);
 		await runtime.start(ctx);
-	});
-
-	pi.on("agent_start", async () => {
-		runtime?.handleAgentStart();
-	});
-
-	pi.on("tool_execution_start", async (event) => {
-		runtime?.recordToolStart(event.toolName, event.args);
-	});
-
-	pi.on("tool_execution_end", async (event) => {
-		runtime?.recordToolEnd(event.toolName, event.isError);
-	});
-
-	pi.on("agent_end", async (event, ctx) => {
-		await runtime?.handleAgentEnd(event as { messages?: unknown[] }, ctx);
 	});
 
 	pi.on("session_shutdown", async () => {

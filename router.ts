@@ -21,6 +21,7 @@ import { maskAppId, type PiQQBotConfig } from "./config";
 import { QQApi, QQApiError } from "./qq-api";
 import { QQAuth } from "./qq-auth";
 import { QQGateway } from "./qq-gateway";
+import { QQAgentSession, type QQToolCall } from "./qq-session";
 import { MessageQueue } from "./queue";
 import type { ConnectionState, QQInboundMessage, QQReplyTarget } from "./types";
 
@@ -29,8 +30,8 @@ const MAX_CHUNKS = 5; // hard cap of 5 passive replies per msg_id
 const SUMMARY_MAX = 120;
 const MAX_TRANSCRIPT_LINES = 50;
 
-// pi slash commands that must NOT be triggered from QQ: they tear down the
-// session (killing the in-flight QQ reply) or require local TUI interaction.
+// pi slash commands that must NOT be run from QQ: they are local-session
+// lifecycle/interactive commands with no meaning in the isolated QQ session.
 const BLOCKED_COMMANDS = new Set([
 	"new",
 	"resume",
@@ -76,12 +77,12 @@ export class PiQQBotRuntime {
 	private gateway?: QQGateway;
 	private api?: QQApi;
 	private readonly queue: MessageQueue;
+	private qq?: QQAgentSession;
 
 	private ctx?: ExtensionContext;
-	private busy = false;
+	private running = false;
 	private activeTarget?: QQReplyTarget;
 	private activeFake = false;
-	private transcript: string[] = [];
 
 	private state: ConnectionState = "disconnected";
 	private stateDetail?: string;
@@ -100,6 +101,18 @@ export class PiQQBotRuntime {
 
 	async start(ctx: ExtensionContext): Promise<void> {
 		this.ctx = ctx;
+
+		// Isolated QQ session first, so QQ traffic never touches the local session.
+		this.qq = new QQAgentSession();
+		try {
+			await this.qq.init(process.cwd());
+		} catch (err) {
+			this.qq = undefined;
+			this.lastError = `qq session init failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.notify(`pi-qqbot: ${this.lastError}`, "error");
+			return; // without an isolated session we must not fall back to the local session
+		}
+
 		this.auth = new QQAuth(this.config.appId, this.config.clientSecret);
 		this.api = new QQApi(this.auth, { sandbox: this.config.sandbox ?? true });
 		this.gateway = new QQGateway(
@@ -123,10 +136,12 @@ export class PiQQBotRuntime {
 	async stop(): Promise<void> {
 		this.gateway?.close();
 		this.gateway = undefined;
+		this.qq?.dispose();
+		this.qq = undefined;
 		this.queue.clear();
 		this.activeTarget = undefined;
 		this.activeFake = false;
-		this.busy = false;
+		this.running = false;
 		this.state = "disconnected";
 	}
 
@@ -136,53 +151,42 @@ export class PiQQBotRuntime {
 		await this.gateway.reconnect();
 	}
 
-	// --- Agent lifecycle -----------------------------------------------------
+	// --- Agent run (isolated QQ session) ------------------------------------
 
-	handleAgentStart(): void {
-		this.busy = true;
-	}
-
-	/** Record a tool call into the current QQ turn's process transcript. */
-	recordToolStart(toolName: string, args: unknown): void {
-		if (!this.activeTarget || !this.config.showProcess) return;
-		if (this.transcript.length >= MAX_TRANSCRIPT_LINES) {
-			if (this.transcript[this.transcript.length - 1] !== "…") this.transcript.push("…");
+	private async runOne(msg: QQInboundMessage): Promise<void> {
+		if (!this.qq?.isReady()) {
+			this.lastError = "qq session not ready";
 			return;
 		}
-		this.transcript.push(`${toolName}: ${argSummary(args)}`);
-	}
-
-	recordToolEnd(_toolName: string, isError: boolean): void {
-		if (!this.activeTarget || !this.config.showProcess) return;
-		const last = this.transcript.length - 1;
-		if (last >= 0 && this.transcript[last] !== "…") {
-			this.transcript[last] += isError ? " \u274c" : " \u2713";
-		}
-	}
-
-	async handleAgentEnd(event: { messages?: unknown[] }, ctx: ExtensionContext): Promise<void> {
-		this.ctx = ctx;
-		this.busy = false;
-
-		const target = this.activeTarget;
-		const fake = this.activeFake;
-		if (target) {
-			this.activeTarget = undefined;
-			this.activeFake = false;
-			const transcript = this.transcript;
-			this.transcript = [];
-			const finalText = extractFinalAssistantText(event.messages ?? []);
-			const body = this.config.showProcess ? formatWithProcess(transcript, finalText) : finalText;
+		this.running = true;
+		const target: QQReplyTarget = {
+			type: msg.type,
+			userOpenId: msg.userOpenId,
+			groupOpenId: msg.groupOpenId,
+			msgId: msg.id,
+			createdAt: Date.now(),
+		};
+		this.activeTarget = target;
+		this.activeFake = msg.fake === true;
+		try {
+			const { text, tools } = await this.qq.run(buildPrompt(msg));
+			const body = this.config.showProcess
+				? formatWithProcess(buildTranscript(tools), text)
+				: text;
 			if (body.trim()) {
-				await this.deliverReply(target, body, fake);
+				await this.deliverReply(target, body, this.activeFake);
 			} else {
 				this.debugLog("assistant produced no text; nothing to send");
 			}
-		} else {
-			this.transcript = [];
+		} catch (err) {
+			this.lastError = `qq session run failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.debugLog(this.lastError);
+		} finally {
+			this.running = false;
+			this.activeTarget = undefined;
+			this.activeFake = false;
+			this.schedulePump();
 		}
-
-		this.schedulePump();
 	}
 
 	// --- Inbound -------------------------------------------------------------
@@ -238,9 +242,9 @@ export class PiQQBotRuntime {
 	/**
 	 * Handle a QQ message that starts with "/".
 	 *  - /qqbot-status | /qqbot-last | /qqbot-help | /help -> answered to QQ.
-	 *  - blocked lifecycle/interactive commands -> refused.
-	 *  - other known commands -> forwarded to pi (fire-and-forget) if allowCommands.
-	 *  - unknown "/..." -> treated as a normal prompt.
+	 *  - blocked local-session lifecycle commands -> refused.
+	 *  - anything else -> run in the isolated QQ session as input (when
+	 *    allowCommands), otherwise refused with a hint.
 	 */
 	private handleCommand(msg: QQInboundMessage, text: string): void {
 		const name = text.slice(1).split(/\s+/)[0].toLowerCase();
@@ -258,42 +262,15 @@ export class PiQQBotRuntime {
 			return;
 		}
 		if (BLOCKED_COMMANDS.has(name)) {
-			void this.replyToQQ(msg, `\u547d\u4ee4 /${name} \u4e0d\u80fd\u4ece QQ \u6267\u884c\uff08\u4f1a\u5f71\u54cd\u4f1a\u8bdd\u6216\u9700\u8981\u672c\u5730\u4ea4\u4e92\uff09\u3002`);
+			void this.replyToQQ(msg, `\u547d\u4ee4 /${name} \u4e0d\u652f\u6301\u4ece QQ \u6267\u884c\uff08\u672c\u5730\u4f1a\u8bdd\u751f\u547d\u5468\u671f/\u4ea4\u4e92\u547d\u4ee4\uff09\u3002`);
 			return;
 		}
 		if (!this.config.allowCommands) {
-			void this.replyToQQ(msg, "\u547d\u4ee4\u8f6c\u53d1\u672a\u5f00\u542f\u3002\u53d1 /qqbot-help \u770b\u53ef\u7528\u547d\u4ee4\u3002");
+			void this.replyToQQ(msg, "\u547d\u4ee4\u672a\u5f00\u542f\u3002\u53d1 /qqbot-help \u770b\u53ef\u7528\u547d\u4ee4\u3002");
 			return;
 		}
-		if (!this.knownCommand(name)) {
-			// Not a real command; treat it as a normal prompt so the reply is captured.
-			this.enqueuePrompt(msg);
-			return;
-		}
-		this.forwardCommand(text);
-		void this.replyToQQ(msg, `\u5df2\u5728\u672c\u5730 pi \u6267\u884c /${name}\uff08\u8f93\u51fa\u663e\u793a\u5728\u672c\u5730\u754c\u9762\uff0c\u4e0d\u56de\u4f20 QQ\uff09\u3002`);
-	}
-
-	private knownCommand(name: string): boolean {
-		try {
-			return this.pi.getCommands().some((c) => c.name === name);
-		} catch {
-			return false;
-		}
-	}
-
-	private forwardCommand(text: string): void {
-		try {
-			if (this.busy) this.pi.sendUserMessage(text, { deliverAs: "followUp" });
-			else this.pi.sendUserMessage(text);
-		} catch {
-			try {
-				this.pi.sendUserMessage(text, { deliverAs: "followUp" });
-			} catch (err) {
-				this.lastError = `forward failed: ${err instanceof Error ? err.message : String(err)}`;
-				this.debugLog(this.lastError);
-			}
-		}
+		// Treat as input to the isolated QQ session (kept verbatim, including the "/").
+		this.enqueuePrompt(msg);
 	}
 
 	private async replyToQQ(msg: QQInboundMessage, text: string): Promise<void> {
@@ -311,8 +288,8 @@ export class PiQQBotRuntime {
 		const base =
 			"QQ \u53ef\u7528\u547d\u4ee4\uff1a\n/qqbot-status \u72b6\u6001\n/qqbot-last \u6700\u8fd1\u6d88\u606f\n/qqbot-help \u5e2e\u52a9";
 		const tail = this.config.allowCommands
-			? "\n\u5176\u4ed6 pi \u659c\u6760\u547d\u4ee4\u4f1a\u5728\u672c\u5730\u6267\u884c\uff08\u8f93\u51fa\u4e0d\u56de\u4f20\uff09\u3002\u76f4\u63a5\u53d1\u6587\u672c = \u5411 Pi \u63d0\u95ee\u3002"
-			: "\n\u547d\u4ee4\u8f6c\u53d1\u5df2\u5173\u95ed\u3002\u76f4\u63a5\u53d1\u6587\u672c = \u5411 Pi \u63d0\u95ee\u3002";
+			? "\n\u5176\u4ed6 / \u5f00\u5934\u7684\u8f93\u5165\u4f1a\u5728\u72ec\u7acb\u7684 QQ \u4f1a\u8bdd\u91cc\u5904\u7406\u3002\u76f4\u63a5\u53d1\u6587\u672c = \u5411 Pi \u63d0\u95ee\uff08\u72ec\u7acb\u4f1a\u8bdd\uff0c\u4e0d\u5f71\u54cd\u672c\u5730\uff09\u3002"
+			: "\n\u76f4\u63a5\u53d1\u6587\u672c = \u5411 Pi \u63d0\u95ee\uff08\u72ec\u7acb\u4f1a\u8bdd\uff0c\u4e0d\u5f71\u54cd\u672c\u5730\uff09\u3002";
 		return base + tail;
 	}
 
@@ -342,39 +319,11 @@ export class PiQQBotRuntime {
 	}
 
 	private pump(): void {
-		if (this.activeTarget) return; // a QQ turn is in flight
-		if (this.busy) return; // Pi is busy (local or another turn); wait
+		if (this.running) return; // a QQ run is in flight
+		if (!this.qq?.isReady()) return; // isolated session not ready yet
 		const msg = this.queue.dequeue();
 		if (!msg) return;
-
-		this.activeTarget = {
-			type: msg.type,
-			userOpenId: msg.userOpenId,
-			groupOpenId: msg.groupOpenId,
-			msgId: msg.id,
-			createdAt: Date.now(),
-		};
-		this.activeFake = msg.fake === true;
-		this.transcript = [];
-
-		const prompt = buildPrompt(msg);
-		this.safeInject(prompt);
-	}
-
-	private safeInject(prompt: string): void {
-		try {
-			this.pi.sendUserMessage(prompt);
-		} catch {
-			// Agent still finalizing: queue as follow-up (delivered on next idle).
-			try {
-				this.pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-			} catch (err) {
-				this.lastError = `inject failed: ${err instanceof Error ? err.message : String(err)}`;
-				this.debugLog(this.lastError);
-				this.activeTarget = undefined;
-				this.activeFake = false;
-			}
-		}
+		void this.runOne(msg);
 	}
 
 	// --- Outbound ------------------------------------------------------------
@@ -434,7 +383,8 @@ export class PiQQBotRuntime {
 			`pi-qqbot: ${this.config.enabled ? "enabled" : "disabled"} (appId ${maskAppId(this.config.appId)}, ${this.config.sandbox ? "sandbox" : "prod"})`,
 			`connection: ${this.state}${this.stateDetail ? ` (${this.stateDetail})` : ""}`,
 			`queue: ${this.queue.size}`,
-			`commands: ${this.config.allowCommands ? "forwarding on" : "info-only"}`,
+			`session: isolated (${this.qq?.isReady() ? "ready" : "not ready"})`,
+			`commands: ${this.config.allowCommands ? "on (isolated)" : "info-only"}`,
 			`process: ${this.config.showProcess ? "on" : "off"}`,
 			`active: ${this.activeTargetLabel()}`,
 			`last inbound: ${this.lastInbound ? new Date(this.lastInbound.at).toLocaleTimeString() : "none"}`,
@@ -495,34 +445,6 @@ function buildPrompt(msg: QQInboundMessage): string {
 	return `[QQ group=${msg.groupOpenId} user=${msg.userOpenId} message=${msg.id}]\n${msg.text}`;
 }
 
-/**
- * Scan from the end of the messages for the last assistant message that has
- * text content. Handles both string content and content-part arrays.
- */
-export function extractFinalAssistantText(messages: unknown[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i] as { role?: string; content?: unknown } | undefined;
-		if (!m || m.role !== "assistant") continue;
-		const text = extractText(m.content);
-		if (text.trim()) return text;
-	}
-	return "";
-}
-
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter(
-				(p): p is { type: string; text: string } =>
-					!!p && typeof p === "object" && (p as { type?: string }).type === "text" && typeof (p as { text?: unknown }).text === "string",
-			)
-			.map((p) => p.text)
-			.join("");
-	}
-	return "";
-}
-
 function splitChunks(text: string): string[] {
 	if (text.length <= CHUNK_SIZE) return [text];
 	const chunks: string[] = [];
@@ -552,6 +474,19 @@ function argSummary(args: unknown): string {
 	let s = typeof pick === "string" ? pick : JSON.stringify(a);
 	s = (s ?? "").replace(/\s+/g, " ").trim();
 	return s.length > 100 ? `${s.slice(0, 100)}\u2026` : s;
+}
+
+/** Build the process transcript lines from the isolated session's tool calls. */
+function buildTranscript(tools: QQToolCall[]): string[] {
+	const lines: string[] = [];
+	for (const t of tools) {
+		if (lines.length >= MAX_TRANSCRIPT_LINES) {
+			if (lines[lines.length - 1] !== "\u2026") lines.push("\u2026");
+			break;
+		}
+		lines.push(`${t.name}: ${argSummary(t.args)}${t.isError ? " \u274c" : " \u2713"}`);
+	}
+	return lines;
 }
 
 /** Combine a tool-call transcript with the final answer for the QQ reply. */
