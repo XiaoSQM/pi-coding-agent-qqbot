@@ -13,12 +13,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wunaitianwang/pi-qqbot.git"
+    "url": "git+https://github.com/wunaitianwang/pi-coding-agent-qqbot.git"
   },
   "bugs": {
-    "url": "https://github.com/wunaitianwang/pi-qqbot/issues"
+    "url": "https://github.com/wunaitianwang/pi-coding-agent-qqbot/issues"
   },
-  "homepage": "https://github.com/wunaitianwang/pi-qqbot#readme",
+  "homepage": "https://github.com/wunaitianwang/pi-coding-agent-qqbot#readme",
   "pi": {
     "extensions": [
       "./index.ts"

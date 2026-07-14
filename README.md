@@ -1,8 +1,10 @@
-# pi-qqbot
+# Pi Coding Agent QQBot
+
+> Package/extension name: `pi-qqbot`
 
 [中文](#中文说明) | [English](#english)
 
-A Pi extension that connects the official QQ Bot API to a local Pi coding agent.
+A Pi Coding Agent extension that connects the official QQ Bot API to a local Pi coding agent.
 It lets an allowlisted QQ user send text, images, voice, and supported documents
 to Pi and receive Pi's final assistant response back in QQ.
 
@@ -53,7 +55,7 @@ QQ 用户发送文本/附件
 ```bash
 mkdir -p ~/.pi/agent/extensions
 cd ~/.pi/agent/extensions
-git clone <YOUR_REPO_URL> pi-qqbot
+git clone https://github.com/wunaitianwang/pi-coding-agent-qqbot.git pi-qqbot
 cd pi-qqbot
 npm install
 ```
@@ -284,7 +286,7 @@ Clone this repository into Pi's extension directory:
 ```bash
 mkdir -p ~/.pi/agent/extensions
 cd ~/.pi/agent/extensions
-git clone <YOUR_REPO_URL> pi-qqbot
+git clone https://github.com/wunaitianwang/pi-coding-agent-qqbot.git pi-qqbot
 cd pi-qqbot
 npm install
 ```
