@@ -13,7 +13,7 @@ const MAX_ASSISTANT_CHARS = 8_000;
 const UI_THROTTLE_MS = 80;
 
 interface ViewLine {
-	kind: "inbound" | "queue" | "run" | "assistant" | "tool" | "reply" | "error";
+	kind: "inbound" | "queue" | "attachment" | "run" | "assistant" | "tool" | "reply" | "error";
 	text: string;
 	at: number;
 	messageId?: string;
@@ -101,9 +101,11 @@ export class TerminalConversationView implements QQConversationObserver {
 				break;
 			case "inbound": {
 				const prefix = event.fake ? "[fake] " : "";
+				const attachments = summarizeKinds(event.attachmentKinds);
+				const text = bounded(sanitizeText(event.text), MAX_INBOUND_CHARS);
 				this.push({
 					kind: "inbound",
-					text: `${prefix}${event.channel === "group" ? "QQ群" : "QQ"} ${shortOpenId(event.senderLabel)}  ${bounded(sanitizeText(event.text), MAX_INBOUND_CHARS)}`,
+					text: `${prefix}${event.channel === "group" ? "QQ群" : "QQ"} ${shortOpenId(event.senderLabel)}${attachments ? `  ${attachments}` : ""}${text ? `  ${text}` : ""}`,
 					at: event.at,
 					messageId: event.messageId,
 				});
@@ -119,6 +121,37 @@ export class TerminalConversationView implements QQConversationObserver {
 				});
 				this.updateStatus();
 				break;
+			case "attachment_start":
+				this.push({
+					kind: "attachment",
+					text: `↓ ${event.attachmentKind} ${event.index}/${event.total}  ${singleLine(event.filename)}`,
+					at: event.at,
+					messageId: event.messageId,
+					state: "running",
+				});
+				break;
+			case "attachment_progress": {
+				const current = this.findLatest("attachment", event.messageId, "running");
+				if (current) {
+					current.text = `↓ ${event.attachmentKind} ${event.index}/${event.total}  ${singleLine(event.filename)}  ${formatBytes(event.bytes ?? 0)}`;
+					current.at = event.at;
+				}
+				break;
+			}
+			case "attachment_end":
+			case "attachment_rejected": {
+				const current = this.findLatest("attachment", event.messageId, "running");
+				const ok = event.kind === "attachment_end" && event.status === "ready";
+				const text = `${ok ? "✓" : "✗"} ${event.attachmentKind}  ${singleLine(event.filename)}${event.bytes ? `  ${formatBytes(event.bytes)}` : ""}${event.note ? `  ${bounded(singleLine(event.note), 160)}` : ""}`;
+				if (current) {
+					current.text = text;
+					current.state = ok ? "success" : "error";
+					current.at = event.at;
+				} else {
+					this.push({ kind: "attachment", text, at: event.at, messageId: event.messageId, state: ok ? "success" : "error" });
+				}
+				break;
+			}
 			case "run_start":
 				this.runtime.running = true;
 				this.push({
@@ -379,6 +412,18 @@ function styleLine(line: ViewLine, theme: Theme): string {
 						? "text"
 						: "muted";
 	return `${theme.fg("dim", time)} ${theme.fg(color, line.text)}${state}`;
+}
+
+function summarizeKinds(kinds: string[]): string {
+	if (!kinds.length) return "";
+	const counts = new Map<string, number>();
+	for (const kind of kinds) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+	return `[${[...counts].map(([kind, count]) => `${kind}×${count}`).join(", ")}]`;
+}
+
+function formatBytes(bytes: number): string {
+	if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+	return `${Math.max(0, Math.round(bytes / 1024))} KiB`;
 }
 
 function argSummary(args: unknown): string {

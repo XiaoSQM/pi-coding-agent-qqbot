@@ -13,26 +13,28 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 
+import { AttachmentPipeline, classifyAttachment } from "./attachment-pipeline";
 import { maskAppId } from "./config";
 import { QQApi, QQApiError } from "./qq-api";
 import { QQAuth } from "./qq-auth";
 import { QQGateway } from "./qq-gateway";
 import { QQAgentSession, type QQAgentRunEvent, type QQToolCall } from "./qq-session";
 import { MessageQueue } from "./queue";
+import { formatQQReply, QQ_MAX_REPLY_CHUNKS } from "./reply-formatter";
 import type {
 	ConnectionState,
 	PiQQBotConfig,
 	QQConversationObserver,
 	QQInboundMessage,
+	PreparedAttachment,
 	QQReplyTarget,
 	QQTerminalEvent,
 } from "./types";
 
-const CHUNK_SIZE = 800;
-const MAX_CHUNKS = 5; // hard cap of 5 passive replies per msg_id
 const SUMMARY_MAX = 120;
-const MAX_TRANSCRIPT_LINES = 50;
+const MAX_TRANSCRIPT_LINES = 6;
 
 // pi slash commands that must NOT be run from QQ: they are local-session
 // lifecycle/interactive commands with no meaning in the isolated QQ session.
@@ -60,6 +62,7 @@ interface InboundSummary {
 	user: string;
 	group?: string;
 	text: string;
+	attachments: string[];
 	at: number;
 	authorized?: boolean;
 }
@@ -80,7 +83,10 @@ export class PiQQBotRuntime {
 	private gateway?: QQGateway;
 	private api?: QQApi;
 	private readonly queue: MessageQueue;
+	private readonly attachmentPipeline: AttachmentPipeline;
+	private readonly seenMessages = new MessageDedupe(2 * 60 * 60 * 1000, 2000);
 	private qq?: QQAgentSession;
+	private runtimeAbort = new AbortController();
 
 	private ctx?: ExtensionContext;
 	private running = false;
@@ -90,6 +96,8 @@ export class PiQQBotRuntime {
 	private state: ConnectionState = "disconnected";
 	private stateDetail?: string;
 	private lastError?: string;
+	private lastAttachmentError?: string;
+	private activeAttachmentStatus?: string;
 	private lastInbound?: InboundSummary;
 	private lastOutbound?: OutboundSummary;
 
@@ -101,6 +109,7 @@ export class PiQQBotRuntime {
 	constructor(config: PiQQBotConfig) {
 		this.config = config;
 		this.queue = new MessageQueue(config.maxQueueSize ?? 20);
+		this.attachmentPipeline = new AttachmentPipeline(config, randomUUID());
 	}
 
 	attachObserver(observer: QQConversationObserver): void {
@@ -118,6 +127,7 @@ export class PiQQBotRuntime {
 
 	async start(ctx: ExtensionContext): Promise<boolean> {
 		this.ctx = ctx;
+		this.runtimeAbort = new AbortController();
 
 		// Isolated QQ session first, so QQ traffic never touches the local session.
 		const qq = new QQAgentSession();
@@ -162,6 +172,8 @@ export class PiQQBotRuntime {
 	}
 
 	async stop(): Promise<void> {
+		this.runtimeAbort.abort(new Error("QQBot stopped"));
+		await this.qq?.abort();
 		if (this.pumpTimer) clearTimeout(this.pumpTimer);
 		this.pumpTimer = undefined;
 		this.pumpScheduled = false;
@@ -172,6 +184,7 @@ export class PiQQBotRuntime {
 		this.queue.clear();
 		this.activeTarget = undefined;
 		this.activeFake = false;
+		this.activeAttachmentStatus = undefined;
 		this.running = false;
 		this.state = "disconnected";
 		this.stateDetail = undefined;
@@ -204,8 +217,52 @@ export class PiQQBotRuntime {
 		this.activeFake = msg.fake === true;
 		this.emit({ kind: "run_start", messageId: msg.id, at: Date.now() });
 		this.emitRuntimeState();
+		let prepared: Awaited<ReturnType<AttachmentPipeline["prepare"]>> | undefined;
 		try {
-			const { text, tools } = await this.qq.run(buildPrompt(msg), (event) =>
+			prepared = await this.attachmentPipeline.prepare(msg, this.runtimeAbort.signal, {
+				onStart: (index, total, attachmentKind, filename) => {
+					this.activeAttachmentStatus = `${attachmentKind} ${index}/${total}: ${filename}`;
+					this.emit({ kind: "attachment_start", messageId: msg.id, index, total, attachmentKind, filename, at: Date.now() });
+				},
+				onProgress: (index, total, attachmentKind, filename, bytes) => {
+					this.emit({ kind: "attachment_progress", messageId: msg.id, index, total, attachmentKind, filename, bytes, at: Date.now() });
+				},
+				onEnd: (index, total, resource, bytes) => {
+					const note = resource.kind === "unsupported" ? resource.reason : resource.note;
+					if (resource.status !== "ready") {
+						this.lastAttachmentError = `${resource.errorCode ?? "attachment_failed"}: ${resource.filename}${note ? ` — ${note}` : ""}`;
+					}
+					this.emit({
+						kind: resource.status === "ready" ? "attachment_end" : "attachment_rejected",
+						messageId: msg.id,
+						index,
+						total,
+						attachmentKind: resource.kind,
+						filename: resource.filename,
+						status: resource.status,
+						bytes,
+						note,
+						at: Date.now(),
+					});
+				},
+			});
+			this.activeAttachmentStatus = undefined;
+
+			const readyImages = prepared.resources.filter((resource) => resource.kind === "image" && resource.status === "ready");
+			if (readyImages.length && !this.qq.supportsImages()) {
+				const reply = msg.text.trim()
+					? "当前 QQ Agent 使用的模型不支持图片理解。我没有读取图片；请切换到支持视觉输入的模型后重试。你的文字内容也未提交，以避免产生误导性回答。"
+					: "当前 QQ Agent 使用的模型不支持图片理解，因此没有运行可能产生误导的模型回合。请切换到支持视觉输入的模型后重试。";
+				await this.deliverReply(target, reply, this.activeFake);
+				return;
+			}
+
+			if (!hasUsableAgentInput(msg, prepared.resources)) {
+				await this.deliverReply(target, formatAttachmentFailures(prepared.resources), this.activeFake);
+				return;
+			}
+
+			const { text, tools } = await this.qq.run(withQQReplyGuidance(prepared.prompt), prepared.images, (event) =>
 				this.forwardAgentEvent(msg.id, event),
 			);
 			const body = this.config.showProcess
@@ -217,13 +274,17 @@ export class PiQQBotRuntime {
 				this.debugLog("assistant produced no text; nothing to send");
 			}
 		} catch (err) {
-			this.lastError = `qq session run failed: ${err instanceof Error ? err.message : String(err)}`;
-			this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
-			this.debugLog(this.lastError);
+			if (!this.runtimeAbort.signal.aborted) {
+				this.lastError = `qq session run failed: ${err instanceof Error ? err.message : String(err)}`;
+				this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
+				this.debugLog(this.lastError);
+			}
 		} finally {
+			await prepared?.cleanup().catch(() => undefined);
 			this.running = false;
 			this.activeTarget = undefined;
 			this.activeFake = false;
+			this.activeAttachmentStatus = undefined;
 			this.emit({ kind: "run_end", messageId: msg.id, at: Date.now() });
 			this.emitRuntimeState();
 			this.schedulePump();
@@ -266,16 +327,20 @@ export class PiQQBotRuntime {
 
 		// Always record the sender so /qqbot-status and /qqbot-last can reveal the
 		// openid even for unauthorized messages (needed to populate the allowlist).
+		const attachmentSummary = msg.attachments.map(
+			(attachment) => `${classifyAttachment(attachment)}:${sanitizeSummaryFilename(attachment.filename)}`,
+		);
 		this.lastInbound = {
 			type: msg.type,
 			user: msg.userOpenId,
 			group: msg.groupOpenId,
 			text: msg.text,
+			attachments: attachmentSummary,
 			at: msg.receivedAt,
 			authorized: allowed,
 		};
 
-		if (!msg.text.trim()) {
+		if (!msg.text.trim() && msg.attachments.length === 0) {
 			this.debugLog("ignored empty message");
 			return;
 		}
@@ -286,6 +351,11 @@ export class PiQQBotRuntime {
 			return;
 		}
 
+		if (!this.seenMessages.admit(msg.id, msg.receivedAt)) {
+			this.debugLog(`ignored duplicate msg_id=${sanitizeLogValue(msg.id)}`);
+			return;
+		}
+
 		const text = msg.text.trim();
 		this.emit({
 			kind: "inbound",
@@ -293,10 +363,12 @@ export class PiQQBotRuntime {
 			channel: msg.type,
 			senderLabel: msg.type === "group" ? msg.groupOpenId ?? msg.userOpenId : msg.userOpenId,
 			text,
+			attachmentCount: msg.attachments.length,
+			attachmentKinds: msg.attachments.map(classifyAttachment),
 			fake: msg.fake === true,
 			at: msg.receivedAt,
 		});
-		if (text.startsWith("/")) {
+		if (text.startsWith("/") && msg.attachments.length === 0) {
 			this.handleCommand(msg, text);
 			return;
 		}
@@ -383,6 +455,7 @@ export class PiQQBotRuntime {
 			type: "private",
 			text,
 			userOpenId: "FAKE_USER",
+			attachments: [],
 			raw: { fake: true },
 			receivedAt: Date.now(),
 			fake: true,
@@ -415,7 +488,8 @@ export class PiQQBotRuntime {
 
 	private async deliverReply(target: QQReplyTarget, text: string, fake: boolean): Promise<void> {
 		const full = (this.config.replyPrefix ?? "") + text;
-		const chunks = splitChunks(full);
+		const formatted = formatQQReply(full, this.config.replyFormat);
+		const chunks = this.config.replyFormat === "plain" ? formatted.plain : formatted.markdown;
 
 		this.lastOutbound = {
 			type: target.type,
@@ -441,7 +515,7 @@ export class PiQQBotRuntime {
 				sentChunks: chunks.length,
 				at: Date.now(),
 			});
-			this.debugLog(`[fake] would send ${chunks.length} chunk(s) to ${target.type}`);
+			this.debugLog(`[fake] would send ${chunks.length} ${this.config.replyFormat === "plain" ? "plain" : "markdown"} chunk(s) to ${target.type}`);
 			return;
 		}
 		if (!this.api) {
@@ -458,9 +532,22 @@ export class PiQQBotRuntime {
 		}
 
 		let sentChunks = 0;
-		for (let i = 0; i < chunks.length; i++) {
+		let nextMsgSeq = 1;
+		let useMarkdown = this.config.replyFormat !== "plain";
+		for (let i = 0; i < chunks.length && i < QQ_MAX_REPLY_CHUNKS; i++) {
 			try {
-				await this.api.sendText(target, chunks[i], i + 1);
+				if (!useMarkdown) {
+					await this.api.sendText(target, formatted.plain[i], nextMsgSeq++);
+				} else {
+					const fellBack = await this.sendMarkdownWithFallback(
+						target,
+						formatted.markdown[i],
+						formatted.plain[i],
+						nextMsgSeq,
+					);
+					nextMsgSeq += fellBack ? 2 : 1;
+					if (fellBack) useMarkdown = false;
+				}
 				sentChunks++;
 			} catch (err) {
 				const detail = err instanceof QQApiError ? err.message : String(err);
@@ -475,7 +562,7 @@ export class PiQQBotRuntime {
 				});
 				this.debugLog(this.lastError);
 				this.notify(`pi-qqbot send failed: ${detail}`, "error");
-				return; // passive-reply window/cap likely exceeded
+				return;
 			}
 		}
 		this.emit({
@@ -485,6 +572,26 @@ export class PiQQBotRuntime {
 			sentChunks,
 			at: Date.now(),
 		});
+	}
+
+	private async sendMarkdownWithFallback(
+		target: QQReplyTarget,
+		markdown: string,
+		plain: string,
+		msgSeq: number,
+	): Promise<boolean> {
+		if (!this.api) throw new Error("QQ API is not ready");
+		try {
+			await this.api.sendMarkdown(target, markdown, msgSeq);
+			return false;
+		} catch (err) {
+			if (!(err instanceof QQApiError) || !canFallbackFromMarkdown(err)) throw err;
+			this.debugLog(`markdown rejected; falling back to plain text (status ${err.status}${err.code != null ? `, code ${err.code}` : ""})`);
+			// A rejected HTTP response did not deliver a QQ message. Use the next
+			// sequence number and keep subsequent chunks plain for this reply.
+			await this.api.sendText(target, plain, msgSeq + 1);
+			return true;
+		}
 	}
 
 	private async sendBusyNotice(msg: QQInboundMessage): Promise<void> {
@@ -497,7 +604,7 @@ export class PiQQBotRuntime {
 			createdAt: Date.now(),
 		};
 		try {
-			await this.api.sendText(target, "Busy right now, please try again shortly.", 1);
+			await this.api.sendText(target, "当前消息较多，请稍后重试。", 1);
 		} catch (err) {
 			this.debugLog(`busy notice failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -513,10 +620,14 @@ export class PiQQBotRuntime {
 			`session: isolated (${this.qq?.isReady() ? "ready" : "not ready"})`,
 			`commands: ${this.config.allowCommands ? "on (isolated)" : "info-only"}`,
 			`process: ${this.config.showProcess ? "on" : "off"}`,
+			`reply format: ${this.config.replyFormat}`,
+			`media: ${this.config.media.enabled ? "on" : "off"}`,
 			`active: ${this.activeTargetLabel()}`,
+			`attachment: ${this.activeAttachmentStatus ?? "idle"}`,
 			`last inbound: ${this.lastInbound ? new Date(this.lastInbound.at).toLocaleTimeString() : "none"}`,
 			`last outbound: ${this.lastOutbound ? new Date(this.lastOutbound.at).toLocaleTimeString() : "none"}`,
 		];
+		if (this.lastAttachmentError) lines.push(`last attachment error: ${this.lastAttachmentError}`);
 		if (this.lastError) lines.push(`last error: ${this.lastError}`);
 		return lines.join("\n");
 	}
@@ -524,8 +635,11 @@ export class PiQQBotRuntime {
 	lastSummary(): string {
 		const lines: string[] = [];
 		if (this.lastInbound) {
+			const attachmentText = this.lastInbound.attachments.length
+				? ` attachments=[${this.lastInbound.attachments.map(truncate).join(", ")}]`
+				: "";
 			lines.push(
-				`last inbound: ${this.lastInbound.type} ${labelFor(this.lastInbound)}${this.lastInbound.authorized === false ? " (unauthorized — add to allowlist)" : ""} text="${truncate(this.lastInbound.text)}"`,
+				`last inbound: ${this.lastInbound.type} ${labelFor(this.lastInbound)}${this.lastInbound.authorized === false ? " (unauthorized — add to allowlist)" : ""} text="${truncate(this.lastInbound.text)}"${attachmentText}`,
 			);
 		}
 		if (this.lastOutbound) {
@@ -533,6 +647,7 @@ export class PiQQBotRuntime {
 				`last outbound: ${this.lastOutbound.type}${this.lastOutbound.fake ? " (fake)" : ""} ${labelFor(this.lastOutbound)} text="${truncate(this.lastOutbound.text)}"`,
 			);
 		}
+		if (this.lastAttachmentError) lines.push(`last attachment error: ${this.lastAttachmentError}`);
 		if (this.lastError) lines.push(`last error: ${this.lastError}`);
 		return lines.length ? lines.join("\n") : "no QQBot events yet";
 	}
@@ -589,24 +704,63 @@ export function isAllowed(config: PiQQBotConfig, msg: QQInboundMessage): boolean
 	return false;
 }
 
-function buildPrompt(msg: QQInboundMessage): string {
-	if (msg.type === "private") {
-		return `[QQ private user=${msg.userOpenId} message=${msg.id}]\n${msg.text}`;
-	}
-	return `[QQ group=${msg.groupOpenId} user=${msg.userOpenId} message=${msg.id}]\n${msg.text}`;
+function hasUsableAgentInput(msg: QQInboundMessage, resources: PreparedAttachment[]): boolean {
+	if (msg.text.trim()) return true;
+	return resources.some((resource) => resource.status === "ready");
 }
 
-function splitChunks(text: string): string[] {
-	if (text.length <= CHUNK_SIZE) return [text];
-	const chunks: string[] = [];
-	for (let i = 0; i < text.length && chunks.length < MAX_CHUNKS; i += CHUNK_SIZE) {
-		chunks.push(text.slice(i, i + CHUNK_SIZE));
+function formatAttachmentFailures(resources: PreparedAttachment[]): string {
+	const failures = resources.filter((resource) => resource.status !== "ready");
+	if (!failures.length) return "没有可处理的文本或附件内容。";
+	return failures
+		.map((resource) => {
+			const note = resource.kind === "unsupported" ? resource.reason : resource.note ?? "处理失败";
+			return `${resource.filename}：${note}（${resource.errorCode ?? "attachment_failed"}）`;
+		})
+		.join("\n");
+}
+
+function sanitizeSummaryFilename(value: string): string {
+	return value.replace(/[\u0000-\u001f\u007f]/g, "").replace(/[\\/]/g, "_").slice(0, 80) || "attachment";
+}
+
+function sanitizeLogValue(value: string): string {
+	return value.replace(/[\r\n\t]/g, "_").slice(0, 120);
+}
+
+class MessageDedupe {
+	private readonly entries = new Map<string, number>();
+
+	constructor(
+		private readonly ttlMs: number,
+		private readonly maxEntries: number,
+	) {}
+
+	admit(id: string, now = Date.now()): boolean {
+		for (const [key, expiry] of this.entries) {
+			if (expiry > now) break;
+			this.entries.delete(key);
+		}
+		const existing = this.entries.get(id);
+		if (existing !== undefined && existing > now) return false;
+		this.entries.delete(id);
+		this.entries.set(id, now + this.ttlMs);
+		while (this.entries.size > this.maxEntries) {
+			const oldest = this.entries.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			this.entries.delete(oldest);
+		}
+		return true;
 	}
-	const consumed = chunks.length * CHUNK_SIZE;
-	if (consumed < text.length && chunks.length > 0) {
-		chunks[chunks.length - 1] = `${chunks[chunks.length - 1].slice(0, CHUNK_SIZE - 1)}…`;
-	}
-	return chunks;
+}
+
+function withQQReplyGuidance(prompt: string): string {
+	return `${prompt}\n\n<qq-reply-guidance>\n以下要求仅约束最终回答的呈现，不改变用户任务本身：请为手机 QQ 聊天界面组织最终回答，先直接给出答案或结论，删除寒暄和“好问题”等填充语；短回答不要强加标题；普通回答按“结论 → 关键点或步骤 → 必要注意事项”组织。每段只表达一个主题，段落简短；并列信息用无序列表，操作流程用有序列表，列表不要超过两层。仅对关键字使用粗体，风险或限制使用带文字标签的引用块（如“⚠️ 注意”）。避免宽表格，优先改成列表；代码仅保留必要、可复制的片段。不要添加“执行过程”章节，插件会在需要时附加执行摘要。输出 QQ 支持的简洁 Markdown，不要为了装饰堆叠标题、分割线或 Emoji。\n</qq-reply-guidance>`;
+}
+
+function canFallbackFromMarkdown(err: QQApiError): boolean {
+	if (!err.requestAccepted || err.status === 401 || err.status === 403 || err.status === 429 || err.status >= 500) return false;
+	return /markdown|invalid request|not allowed|不允许|不支持/i.test(err.message) || err.status === 400;
 }
 
 function truncate(text: string): string {
@@ -631,20 +785,16 @@ function argSummary(args: unknown): string {
 function buildTranscript(tools: QQToolCall[]): string[] {
 	const lines: string[] = [];
 	for (const t of tools) {
-		if (lines.length >= MAX_TRANSCRIPT_LINES) {
-			if (lines[lines.length - 1] !== "\u2026") lines.push("\u2026");
-			break;
-		}
-		lines.push(`${t.name}: ${argSummary(t.args)}${t.isError ? " \u274c" : " \u2713"}`);
+		if (lines.length >= MAX_TRANSCRIPT_LINES) break;
+		lines.push(`- ${t.isError ? "❌" : "✅"} **${t.name}**：${argSummary(t.args) || (t.isError ? "执行失败" : "完成")}`);
 	}
+	if (tools.length > MAX_TRANSCRIPT_LINES) lines.push(`- 其余 ${tools.length - MAX_TRANSCRIPT_LINES} 项已省略`);
 	return lines;
 }
 
-/** Combine a tool-call transcript with the final answer for the QQ reply. */
+/** Keep the user-facing answer first; append only a compact execution summary. */
 function formatWithProcess(transcript: string[], finalText: string): string {
 	if (!transcript.length) return finalText;
-	const lines = transcript.map((l, i) => (l === "\u2026" ? "\u2026" : `${i + 1}. ${l}`)).join("\n");
-	const header = `\u{1f527} \u6267\u884c\u8fc7\u7a0b:\n${lines}`;
-	const sep = "\n\u2014\u2014 \u56de\u590d \u2014\u2014\n";
-	return `${header}${sep}${finalText || "(\u65e0\u6587\u672c\u56de\u590d)"}`;
+	const answer = finalText.trim() || "（无文本回复）";
+	return `${answer}\n\n***\n\n## 执行摘要\n\n${transcript.join("\n")}`;
 }

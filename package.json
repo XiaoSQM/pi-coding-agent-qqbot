@@ -1,6 +1,6 @@
 {
   "name": "pi-qqbot",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A Pi extension that connects the official QQ Bot API to a local Pi coding agent.",
   "license": "Apache-2.0",
   "type": "module",
@@ -25,6 +25,7 @@
     ]
   },
   "dependencies": {
+    "unpdf": "1.6.2",
     "ws": "^8.21.0"
   }
 }

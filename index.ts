@@ -1,5 +1,5 @@
 /**
- * pi-qqbot: connect the official QQ Bot API to Pi (text-only MVP).
+ * pi-qqbot: connect official QQ text and rich-media events to Pi.
  *
  * Lifecycle:
  *  - Commands are registered immediately (in the factory).

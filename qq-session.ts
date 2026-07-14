@@ -20,6 +20,8 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+import type { QQImageContent } from "./types";
+
 export interface QQToolCall {
 	toolCallId: string;
 	name: string;
@@ -71,6 +73,14 @@ function loadSdk(): Promise<any> {
 	return sdkPromise;
 }
 
+export async function loadResizeImage(): Promise<(
+	inputBytes: Uint8Array,
+	mimeType: string,
+) => Promise<{ data: string; mimeType: string } | null>> {
+	const sdk = await loadSdk();
+	return sdk.resizeImage;
+}
+
 export class QQAgentSession {
 	// biome-ignore lint/suspicious/noExplicitAny: AgentSession typing comes from the dynamic SDK.
 	private session: any;
@@ -108,7 +118,7 @@ export class QQAgentSession {
 	 *
 	 * Callers must serialize runs (one at a time); the router's queue does this.
 	 */
-	async run(prompt: string, observer?: QQAgentRunObserver): Promise<QQRunResult> {
+	async run(prompt: string, images: QQImageContent[] = [], observer?: QQAgentRunObserver): Promise<QQRunResult> {
 		if (!this.session) throw new Error("QQ session not initialized");
 		const tools: QQToolCall[] = [];
 		const toolIndexes = new Map<string, number>();
@@ -146,11 +156,23 @@ export class QQAgentSession {
 			}
 		});
 		try {
-			await this.session.prompt(prompt);
+			await this.session.prompt(prompt, { images, source: "extension" });
 		} finally {
 			unsubscribe();
 		}
 		return { text: extractFinalAssistantText(messages), tools };
+	}
+
+	supportsImages(): boolean {
+		return Array.isArray(this.session?.model?.input) && this.session.model.input.includes("image");
+	}
+
+	async abort(): Promise<void> {
+		try {
+			await this.session?.abort?.();
+		} catch {
+			// ignore abort errors during shutdown
+		}
 	}
 
 	dispose(): void {

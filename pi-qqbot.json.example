@@ -11,5 +11,30 @@
   "sendBusyNotice": false,
   "allowCommands": false,
   "showProcess": false,
+  "replyFormat": "auto",
+  "media": {
+    "enabled": true,
+    "maxAttachments": 4,
+    "maxTotalBytes": 31457280,
+    "downloadTimeoutMs": 120000,
+    "image": {
+      "enabled": true,
+      "maxBytes": 10485760
+    },
+    "voice": {
+      "enabled": true,
+      "preferQQAsr": true,
+      "maxBytes": 26214400
+    },
+    "documents": {
+      "enabled": true,
+      "allowExtensions": [".txt", ".pdf", ".doc"],
+      "maxTxtBytes": 2097152,
+      "maxPdfBytes": 20971520,
+      "maxDocBytes": 10485760,
+      "maxPdfPages": 100,
+      "maxExtractedChars": 150000
+    }
+  },
   "debug": false
 }

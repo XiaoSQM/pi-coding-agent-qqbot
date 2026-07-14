@@ -17,7 +17,7 @@
 import { WebSocket } from "ws";
 
 import type { QQAuth } from "./qq-auth";
-import type { ConnectionState, QQInboundMessage } from "./types";
+import type { ConnectionState, QQAttachment, QQInboundMessage } from "./types";
 
 const PROD_BASE = "https://api.sgroup.qq.com";
 const SANDBOX_BASE = "https://sandbox.api.sgroup.qq.com";
@@ -333,10 +333,12 @@ export class QQGateway {
 			content?: string;
 			group_openid?: string;
 			author?: { user_openid?: string; member_openid?: string };
+			attachments?: unknown;
 		};
 		if (!data || typeof data.id !== "string") return undefined;
 
-		const text = (data.content ?? "").trim();
+		const text = typeof data.content === "string" ? data.content.trim() : "";
+		const attachments = normalizeAttachments(data.attachments);
 		if (t === "C2C_MESSAGE_CREATE") {
 			const userOpenId = data.author?.user_openid;
 			if (!userOpenId) return undefined;
@@ -345,6 +347,7 @@ export class QQGateway {
 				type: "private",
 				text,
 				userOpenId,
+				attachments,
 				raw: d,
 				receivedAt: Date.now(),
 			};
@@ -358,6 +361,7 @@ export class QQGateway {
 			text,
 			userOpenId: memberOpenId,
 			groupOpenId: data.group_openid,
+			attachments,
 			raw: d,
 			receivedAt: Date.now(),
 		};
@@ -372,4 +376,52 @@ export class QQGateway {
 			}
 		}
 	}
+}
+
+function normalizeAttachments(value: unknown): QQAttachment[] {
+	if (!Array.isArray(value)) return [];
+	const result: QQAttachment[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const raw = item as Record<string, unknown>;
+		const contentType = stringField(raw.content_type);
+		const filename = stringField(raw.filename) || defaultFilename(contentType, result.length + 1);
+		const size = numberField(raw.size);
+		const width = numberField(raw.width);
+		const height = numberField(raw.height);
+		const url = normalizeQQUrl(raw.url);
+		const voiceWavUrl = normalizeQQUrl(raw.voice_wav_url);
+		const asrReferText = stringField(raw.asr_refer_text);
+		result.push({
+			contentType,
+			filename,
+			...(size !== undefined ? { size } : {}),
+			...(width !== undefined ? { width } : {}),
+			...(height !== undefined ? { height } : {}),
+			...(url ? { url } : {}),
+			...(voiceWavUrl ? { voiceWavUrl } : {}),
+			...(asrReferText ? { asrReferText } : {}),
+		});
+	}
+	return result;
+}
+
+function normalizeQQUrl(value: unknown): string | undefined {
+	const url = stringField(value);
+	if (!url) return undefined;
+	return url.startsWith("//") ? `https:${url}` : url;
+}
+
+function stringField(value: unknown): string {
+	return typeof value === "string" ? value.trim() : "";
+}
+
+function numberField(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function defaultFilename(contentType: string, index: number): string {
+	if (contentType.startsWith("image/")) return `image-${index}`;
+	if (contentType === "voice" || contentType.startsWith("audio/")) return `voice-${index}`;
+	return `attachment-${index}`;
 }

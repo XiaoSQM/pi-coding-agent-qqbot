@@ -1,5 +1,5 @@
 /**
- * FIFO queue that serializes inbound QQ messages for the MVP.
+ * FIFO queue that serializes complete inbound QQ messages.
  *
  * Pi has a single active session, so QQ conversations are processed one at a
  * time to avoid overlapping turns and misdirected replies. When the queue is
