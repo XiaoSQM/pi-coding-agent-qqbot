@@ -1,6 +1,6 @@
 # Pi Coding Agent QQBot
 
-> Package/extension name: `@XiaoSQM/pi-qqbot`
+> Package/extension name: `@xsqm/pi-qqbot`
 
 [中文](#中文说明) | [English](#english)
 
@@ -56,7 +56,7 @@ QQ 用户发送文本/附件
 ```bash
 mkdir -p ~/.pi/agent/extensions
 cd ~/.pi/agent/extensions
-pi install npm:@XiaoSQM/pi-qqbot
+pi install npm:@xsqm/pi-qqbot
 ```
 
 或从源码安装：
@@ -349,7 +349,7 @@ Clone this repository into Pi's extension directory:
 ```bash
 mkdir -p ~/.pi/agent/extensions
 cd ~/.pi/agent/extensions
-pi install npm:@XiaoSQM/pi-qqbot
+pi install npm:@xsqm/pi-qqbot
 ```
 
 Or install from source:

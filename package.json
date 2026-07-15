@@ -1,6 +1,6 @@
 {
-  "name": "@XiaoSQM/pi-qqbot",
-  "version": "0.4.5",
+  "name": "@xsqm/pi-qqbot",
+  "version": "0.4.6",
   "description": "A Pi extension that connects the official QQ Bot API to a local Pi coding agent.",
   "license": "Apache-2.0",
   "type": "module",
