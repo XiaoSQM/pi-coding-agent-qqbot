@@ -7,13 +7,19 @@
  * by the conversation registry; they never appear in the local TUI's normal
  * session list.
  *
- * Recursion guard: services are created with `noExtensions: true`, so the QQ
- * runtime never loads pi-qqbot again.
+ * Resource policy: QQ runtimes load the host's skills, MCP adapters, packages,
+ * and other extensions so private QQ use has the same tooling surface as local
+ * Pi. Recursion guard: pi-qqbot itself is excluded before load and filtered
+ * again after load, so the isolated runtime never re-enters this extension.
  */
 
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { Type } from "typebox";
 
+import type { QQOutboundDeliveryContext } from "./outbound-media";
+import { formatBytes } from "./outbound-media";
+import { extractFinalAssistantText } from "./user-facing";
 import type { QQImageContent } from "./types";
 
 export interface QQToolCall {
@@ -102,6 +108,7 @@ export class QQAgentSession {
 	private persistent = true;
 	private restore: "recent" | "new" = "recent";
 	private disposed = false;
+	private outboundDelivery?: QQOutboundDeliveryContext;
 
 	/** Create the isolated runtime. Throws if the SDK/model cannot be loaded. */
 	async init(
@@ -129,18 +136,43 @@ export class QQAgentSession {
 			// Read the host's global defaults once, then isolate all QQ-side changes
 			// in memory. `/model` in QQ must never rewrite the local Pi default.
 			const hostSettings = sdk.SettingsManager.create(runtimeCwd, agentDir);
-			const isolatedSettings = sdk.SettingsManager.inMemory(hostSettings.getGlobalSettings());
+			const globalSettings = hostSettings.getGlobalSettings();
+			const extensionPaths = Array.isArray(globalSettings.extensions)
+				? globalSettings.extensions.filter((value: unknown): value is string => typeof value === "string")
+				: [];
+			// Keep host skills/MCP/plugins available, but never re-load pi-qqbot.
+			for (const pattern of PI_QQBOT_EXTENSION_EXCLUDES) {
+				if (!extensionPaths.includes(pattern)) extensionPaths.push(pattern);
+			}
+			const isolatedSettings = sdk.SettingsManager.inMemory({
+				...globalSettings,
+				extensions: extensionPaths,
+			});
 			const services = await sdk.createAgentSessionServices({
 				cwd: runtimeCwd,
 				agentDir,
 				settingsManager: isolatedSettings,
-				resourceLoaderOptions: { noExtensions: true },
+				resourceLoaderOptions: {
+					// Load skills + packages + MCP/plugin extensions from the host agent.
+					extensionsOverride: (base: {
+						extensions: Array<{ path?: string; resolvedPath?: string }>;
+						errors: Array<{ path: string; error: string }>;
+						runtime: unknown;
+					}) => ({
+						...base,
+						extensions: base.extensions.filter(
+							(extension) =>
+								!isPiQQBotExtensionPath(extension.path) && !isPiQQBotExtensionPath(extension.resolvedPath),
+						),
+					}),
+				},
 			});
 			return {
 				...(await sdk.createAgentSessionFromServices({
 					services,
 					sessionManager: manager,
 					sessionStartEvent,
+					customTools: [this.createOutboundMediaTool(sdk)],
 				})),
 				services,
 				diagnostics: services.diagnostics,
@@ -168,6 +200,10 @@ export class QQAgentSession {
 
 	isStreaming(): boolean {
 		return this.runtime?.session?.isStreaming === true;
+	}
+
+	bindOutboundDelivery(context?: QQOutboundDeliveryContext): void {
+		this.outboundDelivery = context;
 	}
 
 	/** Run one QQ prompt to completion. Callers serialize prompt runs. */
@@ -323,6 +359,8 @@ export class QQAgentSession {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
+		this.outboundDelivery?.close();
+		this.outboundDelivery = undefined;
 		const runtime = this.runtime;
 		this.runtime = undefined;
 		try {
@@ -330,6 +368,31 @@ export class QQAgentSession {
 		} catch {
 			// ignore dispose errors on shutdown
 		}
+	}
+
+	// biome-ignore lint/suspicious/noExplicitAny: dynamically imported SDK.
+	private createOutboundMediaTool(sdk: any): any {
+		const qqSession = this;
+		return sdk.defineTool({
+			name: "qq_send_local_file",
+			label: "Send Local File to QQ",
+			description: "Send one real local computer file to the QQ conversation that requested the current task. Use this when the QQ user explicitly asks to send/upload/transfer a local image or file. A local path, Markdown image, or URL in the final answer does not send the file. The target QQ user and reply metadata are securely bound by the plugin; provide only the local path.",
+			parameters: Type.Object({
+				path: Type.String({ description: "Local file path returned by a tool or explicitly provided by the user" }),
+			}),
+			async execute(_toolCallId: string, params: { path: string }) {
+				const delivery = qqSession.outboundDelivery;
+				if (!delivery) throw new Error("No active QQ delivery context (delivery_context_closed)");
+				const record = await delivery.sendLocalFile(params.path, "auto");
+				return {
+					content: [{
+						type: "text",
+						text: `QQ API 已确认发送${record.kind === "image" ? "图片" : "文件"} ${record.filename}（${formatBytes(record.bytes)}）。`,
+					}],
+					details: { filename: record.filename, kind: record.kind, bytes: record.bytes, status: record.status },
+				};
+			},
+		});
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamically imported SDK.
@@ -381,30 +444,24 @@ function normalizeSessionName(value: string | undefined): string | undefined {
 	return normalized ? normalized.slice(0, 80) : undefined;
 }
 
-/** Last assistant message with non-empty text content. */
-function extractFinalAssistantText(messages: unknown[]): string {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index] as { role?: string; content?: unknown } | undefined;
-		if (!message || message.role !== "assistant") continue;
-		const text = extractText(message.content);
-		if (text.trim()) return text;
-	}
-	return "";
-}
+/** Settings exclusions that prevent auto-discovery from enabling pi-qqbot again. */
+const PI_QQBOT_EXTENSION_EXCLUDES = [
+	"!**/pi-qqbot/**",
+	"!**/pi-qqbot",
+	"!**/@xsqm/pi-qqbot/**",
+	"!**/@xsqm/pi-qqbot",
+	"!extensions/pi-qqbot/**",
+	"!extensions/pi-qqbot",
+] as const;
 
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter(
-				(part): part is { type: string; text: string } =>
-					!!part &&
-					typeof part === "object" &&
-					(part as { type?: string }).type === "text" &&
-					typeof (part as { text?: unknown }).text === "string",
-			)
-			.map((part) => part.text)
-			.join("");
-	}
-	return "";
+/** True when a loaded extension path points at this QQ bridge itself. */
+function isPiQQBotExtensionPath(value: string | undefined): boolean {
+	if (!value) return false;
+	const normalized = value.replaceAll("\\", "/").toLowerCase();
+	return (
+		normalized.includes("/pi-qqbot/") ||
+		normalized.endsWith("/pi-qqbot") ||
+		normalized.includes("/@xsqm/pi-qqbot/") ||
+		normalized.endsWith("/@xsqm/pi-qqbot")
+	);
 }

@@ -91,19 +91,23 @@ export class QQBotHost {
 		return this.configFingerprint === fingerprint(config);
 	}
 
-	attach(owner: symbol, config: PiQQBotConfig, observer?: QQConversationObserver): void {
+	attach(owner: symbol, config: PiQQBotConfig, observer?: QQConversationObserver, ctx?: ExtensionContext): void {
 		if (this.stopTimer) clearTimeout(this.stopTimer);
 		this.stopTimer = undefined;
 		this.owners.add(owner);
 		// Config changes that do not alter the runtime fingerprint (for example
 		// page size, allowlists, and command UI settings) take effect immediately.
 		this.applyRuntimeConfig(config);
+		if (ctx) this.runtime?.bindUiContext(ctx);
 		if (observer) this.runtime?.attachObserver(observer);
 	}
 
 	detach(owner: symbol, observer?: QQConversationObserver): void {
 		if (observer) this.runtime?.detachObserver(observer);
 		this.owners.delete(owner);
+		// Drop the local TUI ctx as soon as no extension owns the host so gateway
+		// callbacks during session handoff cannot touch a stale ExtensionContext.
+		if (this.owners.size === 0) this.runtime?.bindUiContext(undefined);
 	}
 
 	async start(ctx: ExtensionContext, observer?: QQConversationObserver): Promise<boolean> {
@@ -111,6 +115,7 @@ export class QQBotHost {
 		this.stopTimer = undefined;
 		await this.stopPromise;
 		if (this.runtime?.isReady()) {
+			this.runtime.bindUiContext(ctx);
 			if (observer) this.runtime.attachObserver(observer);
 			return true;
 		}
@@ -213,6 +218,7 @@ function fingerprint(config: PiQQBotConfig): string {
 		sandbox: config.sandbox,
 		sessions: config.sessions,
 		media: config.media,
+		outboundMedia: config.outboundMedia,
 		maxQueueSize: config.maxQueueSize,
 	});
 }

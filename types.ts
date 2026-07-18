@@ -15,6 +15,21 @@ export interface QQMediaSttConfig {
 	timeoutMs: number;
 }
 
+export interface QQOutboundMediaConfig {
+	enabled: boolean;
+	adminsOnly: boolean;
+	allowPrivate: boolean;
+	allowGroups: boolean;
+	allowedRoots: string[];
+	images: boolean;
+	files: boolean;
+	maxFilesPerTurn: number;
+	maxImageBytes: number;
+	maxFileBytes: number;
+	maxTotalBytes: number;
+	uploadTimeoutMs: number;
+}
+
 export interface QQMediaConfig {
 	enabled: boolean;
 	maxAttachments: number;
@@ -79,8 +94,8 @@ export interface QQStartupConfig {
 }
 
 export interface PiQQBotConfig {
-	/** Persisted config schema. Legacy files without it are normalized as v2. */
-	schemaVersion: 2;
+	/** Persisted config schema. Legacy files are normalized to the current version. */
+	schemaVersion: 3;
 	enabled: boolean;
 	/** @deprecated Use startup.mode. Kept for one-version config compatibility. */
 	autoStart?: boolean;
@@ -103,6 +118,8 @@ export interface PiQQBotConfig {
 	replyFormat: QQReplyFormat;
 	/** Slow-task progress ack inside the passive-reply budget. */
 	progress: QQProgressConfig;
+	/** Local computer -> current QQ conversation rich-media delivery policy. */
+	outboundMedia: QQOutboundMediaConfig;
 	media: QQMediaConfig;
 	debug?: boolean;
 }
@@ -219,6 +236,22 @@ export type ConnectionState =
 	| "error";
 
 export type QQAttachmentEventKind = "attachment_start" | "attachment_progress" | "attachment_end" | "attachment_rejected";
+export type QQOutboundEventKind = "outbound_start" | "outbound_uploaded" | "outbound_sent" | "outbound_failed";
+
+export interface QQMediaUploadResult {
+	fileInfo: string;
+	fileUuid?: string;
+	ttl: number;
+}
+
+export interface QQOutboundDeliveryRecord {
+	filename: string;
+	kind: "image" | "file";
+	bytes: number;
+	status: "sent" | "failed" | "unknown";
+	errorCode?: string;
+	note?: string;
+}
 
 /** Process-local events mirrored only into the Pi terminal that ran /qqbot-start. */
 export type QQTerminalEvent =
@@ -252,6 +285,16 @@ export type QQTerminalEvent =
 			filename: string;
 			bytes?: number;
 			status?: AttachmentStatus;
+			note?: string;
+			at: number;
+	  }
+	| {
+			kind: QQOutboundEventKind;
+			messageId: string;
+			mediaKind: "image" | "file";
+			filename: string;
+			bytes: number;
+			errorCode?: string;
 			note?: string;
 			at: number;
 	  }

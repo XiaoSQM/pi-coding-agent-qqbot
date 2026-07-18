@@ -25,14 +25,14 @@ let debugCommandRegistered = false;
 export default function (pi: ExtensionAPI) {
 	const runtime = () => host?.getRuntime();
 
-	const attachOwner = async (config: PiQQBotConfig): Promise<QQBotHost> => {
+	const attachOwner = async (config: PiQQBotConfig, ctx?: ExtensionContext): Promise<QQBotHost> => {
 		const acquired = await acquireQQBotHost(config);
 		if (host && host !== acquired && ownerAttached) host.detach(OWNER_TOKEN, terminalView);
-		if (host !== acquired || !ownerAttached) {
-			host = acquired;
-			host.attach(OWNER_TOKEN, config, terminalView);
-			ownerAttached = true;
-		}
+		// Always re-attach so a replacement TUI can rebind its ExtensionContext
+		// while the process-level QQ gateway stays connected.
+		host = acquired;
+		host.attach(OWNER_TOKEN, config, terminalView, ctx);
+		ownerAttached = true;
 		return acquired;
 	};
 
@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
 
 	const connect = async (ctx: ExtensionContext): Promise<boolean> => {
 		if (!currentConfig) return false;
-		const currentHost = await attachOwner(currentConfig);
+		const currentHost = await attachOwner(currentConfig, ctx);
 		return currentHost.start(ctx, terminalView);
 	};
 
@@ -295,7 +295,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await attachOwner(config);
+		await attachOwner(config, ctx);
 		// A replacement TUI automatically regains the observer. Users no longer
 		// need to run /qqbot-start after local /new, /resume, /fork, or /reload.
 		attachTerminalView(ctx);

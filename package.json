@@ -33,6 +33,7 @@
     "conversation-registry.ts",
     "host-registry.ts",
     "model-pages.ts",
+    "outbound-media.ts",
     "qq-api.ts",
     "qq-auth.ts",
     "qq-gateway.ts",
@@ -58,12 +59,13 @@
     ]
   },
   "scripts": {
-    "test": "node --experimental-strip-types ./config.test.ts && node --experimental-strip-types ./model-pages.test.ts && node --experimental-strip-types ./qq-keyboard.test.ts && node --experimental-strip-types ./user-facing.test.ts",
+    "test": "node --experimental-strip-types ./config.test.ts && node --experimental-strip-types ./model-pages.test.ts && node --experimental-strip-types ./qq-keyboard.test.ts && node --experimental-strip-types ./user-facing.test.ts && node --experimental-strip-types ./qq-api.test.ts && node --experimental-strip-types ./outbound-media.test.ts",
     "prepack": "npm test",
     "prepublishOnly": "npm test",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
+    "typebox": "1.1.38",
     "unpdf": "1.6.2",
     "ws": "^8.21.0"
   },

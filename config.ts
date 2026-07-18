@@ -4,9 +4,24 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import type { PiQQBotConfig, QQMediaConfig, QQMediaSttConfig } from "./types";
+import type { PiQQBotConfig, QQMediaConfig, QQMediaSttConfig, QQOutboundMediaConfig } from "./types";
 
 export const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-qqbot.json");
+
+const OUTBOUND_MEDIA_DEFAULTS: QQOutboundMediaConfig = {
+	enabled: false,
+	adminsOnly: true,
+	allowPrivate: true,
+	allowGroups: false,
+	allowedRoots: [],
+	images: true,
+	files: true,
+	maxFilesPerTurn: 2,
+	maxImageBytes: 10 * 1024 * 1024,
+	maxFileBytes: 20 * 1024 * 1024,
+	maxTotalBytes: 30 * 1024 * 1024,
+	uploadTimeoutMs: 30_000,
+};
 
 const MEDIA_DEFAULTS: QQMediaConfig = {
 	enabled: true,
@@ -27,7 +42,7 @@ const MEDIA_DEFAULTS: QQMediaConfig = {
 };
 
 const DEFAULTS: PiQQBotConfig = {
-	schemaVersion: 2,
+	schemaVersion: 3,
 	enabled: false,
 	autoStart: true,
 	appId: "",
@@ -68,6 +83,7 @@ const DEFAULTS: PiQQBotConfig = {
 		enabled: true,
 		ackAfterMs: 3_000,
 	},
+	outboundMedia: OUTBOUND_MEDIA_DEFAULTS,
 	media: MEDIA_DEFAULTS,
 	debug: false,
 };
@@ -161,6 +177,7 @@ export async function removeAccessUser(userOpenId: string): Promise<PiQQBotConfi
 export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 	const raw = isRecord(parsed) ? parsed : {};
 	const rawMedia = isRecord(raw.media) ? raw.media : {};
+	const rawOutboundMedia = isRecord(raw.outboundMedia) ? raw.outboundMedia : {};
 	const rawImage = isRecord(rawMedia.image) ? rawMedia.image : {};
 	const rawVoice = isRecord(rawMedia.voice) ? rawMedia.voice : {};
 	const rawDocuments = isRecord(rawMedia.documents) ? rawMedia.documents : {};
@@ -178,7 +195,7 @@ export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 	const config: PiQQBotConfig = {
 		...DEFAULTS,
 		...raw,
-		schemaVersion: 2,
+		schemaVersion: 3,
 		enabled: bool(raw.enabled, DEFAULTS.enabled),
 		autoStart: legacyAutoStart,
 		appId: stringValue(raw.appId, ""),
@@ -227,6 +244,24 @@ export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 			ackAfterMs: integer(rawProgress.ackAfterMs, DEFAULTS.progress.ackAfterMs, 0, 60_000),
 		},
 		debug: bool(raw.debug, false),
+		outboundMedia: {
+			enabled: bool(rawOutboundMedia.enabled, OUTBOUND_MEDIA_DEFAULTS.enabled),
+			adminsOnly: bool(rawOutboundMedia.adminsOnly, OUTBOUND_MEDIA_DEFAULTS.adminsOnly),
+			allowPrivate: bool(rawOutboundMedia.allowPrivate, OUTBOUND_MEDIA_DEFAULTS.allowPrivate),
+			allowGroups: bool(rawOutboundMedia.allowGroups, OUTBOUND_MEDIA_DEFAULTS.allowGroups),
+			allowedRoots: [...new Set(
+				stringArray(rawOutboundMedia.allowedRoots)
+					.map((value) => value.trim())
+					.filter(Boolean),
+			)].slice(0, 20),
+			images: bool(rawOutboundMedia.images, OUTBOUND_MEDIA_DEFAULTS.images),
+			files: bool(rawOutboundMedia.files, OUTBOUND_MEDIA_DEFAULTS.files),
+			maxFilesPerTurn: integer(rawOutboundMedia.maxFilesPerTurn, OUTBOUND_MEDIA_DEFAULTS.maxFilesPerTurn, 1, 3),
+			maxImageBytes: integer(rawOutboundMedia.maxImageBytes, OUTBOUND_MEDIA_DEFAULTS.maxImageBytes, 1, 25 * 1024 * 1024),
+			maxFileBytes: integer(rawOutboundMedia.maxFileBytes, OUTBOUND_MEDIA_DEFAULTS.maxFileBytes, 1, 50 * 1024 * 1024),
+			maxTotalBytes: integer(rawOutboundMedia.maxTotalBytes, OUTBOUND_MEDIA_DEFAULTS.maxTotalBytes, 1, 75 * 1024 * 1024),
+			uploadTimeoutMs: integer(rawOutboundMedia.uploadTimeoutMs, OUTBOUND_MEDIA_DEFAULTS.uploadTimeoutMs, 5_000, 120_000),
+		},
 		media: {
 			enabled: bool(rawMedia.enabled, MEDIA_DEFAULTS.enabled),
 			maxAttachments: integer(rawMedia.maxAttachments, 4, 1, 10),

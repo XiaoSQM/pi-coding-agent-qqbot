@@ -31,6 +31,7 @@ import { QQGateway } from "./qq-gateway";
 import { type QQAgentRunEvent, type QQAgentSession, type QQModelInfo, type QQSessionInfo, type QQToolCall, resolveSdkEntry } from "./qq-session";
 import { buildCommandKeyboard, type QQCommandButton } from "./qq-keyboard";
 import { MessageQueue } from "./queue";
+import { QQOutboundDeliveryContext } from "./outbound-media";
 import { formatQQReply, QQ_MAX_REPLY_CHUNKS } from "./reply-formatter";
 import type {
 	ConnectionState,
@@ -39,6 +40,7 @@ import type {
 	QQInboundMessage,
 	QQKeyboard,
 	PreparedAttachment,
+	QQOutboundDeliveryRecord,
 	QQReplyTarget,
 	QQTerminalEvent,
 } from "./types";
@@ -77,6 +79,8 @@ export class PiQQBotRuntime {
 	private readonly accessRequests = new QQAccessRequestStore();
 	private conversations?: ConversationRegistry;
 	private runtimeAbort = new AbortController();
+	private activeRunAbort?: AbortController;
+	private agentCwd = process.cwd();
 
 	private ctx?: ExtensionContext;
 	private running = false;
@@ -88,6 +92,8 @@ export class PiQQBotRuntime {
 	private lastError?: string;
 	private lastAttachmentError?: string;
 	private activeAttachmentStatus?: string;
+	private lastOutboundMediaError?: string;
+	private activeOutboundMediaStatus?: string;
 	private lastInbound?: InboundSummary;
 	private lastOutbound?: OutboundSummary;
 
@@ -119,6 +125,7 @@ export class PiQQBotRuntime {
 			showProcess: config.showProcess,
 			replyFormat: config.replyFormat,
 			progress: { ...config.progress },
+			outboundMedia: { ...config.outboundMedia, allowedRoots: [...config.outboundMedia.allowedRoots] },
 			debug: config.debug,
 			commands: { ...config.commands, admins: [...config.commands.admins] },
 		};
@@ -153,8 +160,18 @@ export class PiQQBotRuntime {
 		return this.isIdle();
 	}
 
-	async start(ctx: ExtensionContext): Promise<boolean> {
+	/**
+	 * Bind or clear the local TUI context used only for optional notifications.
+	 * The QQ gateway outlives local sessions, so this must be refreshed on
+	 * attach and cleared on detach/shutdown to avoid stale ctx access.
+	 */
+	bindUiContext(ctx?: ExtensionContext): void {
 		this.ctx = ctx;
+	}
+
+	async start(ctx: ExtensionContext): Promise<boolean> {
+		this.bindUiContext(ctx);
+		this.agentCwd = ctx.cwd;
 		this.runtimeAbort = new AbortController();
 		this.state = "connecting";
 		this.emitRuntimeState();
@@ -188,6 +205,8 @@ export class PiQQBotRuntime {
 
 	async stop(): Promise<void> {
 		this.runtimeAbort.abort(new Error("QQBot stopped"));
+		this.activeRunAbort?.abort(new Error("QQBot stopped"));
+		this.activeRunAbort = undefined;
 		if (this.pumpTimer) clearTimeout(this.pumpTimer);
 		this.pumpTimer = undefined;
 		this.pumpScheduled = false;
@@ -200,9 +219,11 @@ export class PiQQBotRuntime {
 		this.activeTarget = undefined;
 		this.activeFake = false;
 		this.activeAttachmentStatus = undefined;
+		this.activeOutboundMediaStatus = undefined;
 		this.running = false;
 		this.state = "disconnected";
 		this.stateDetail = undefined;
+		this.bindUiContext(undefined);
 		this.emitRuntimeState();
 	}
 
@@ -272,9 +293,13 @@ export class PiQQBotRuntime {
 		};
 		this.activeTarget = target;
 		this.activeFake = msg.fake === true;
+		const runAbort = new AbortController();
+		this.activeRunAbort = runAbort;
+		const runSignal = AbortSignal.any([this.runtimeAbort.signal, runAbort.signal]);
 		this.emit({ kind: "run_start", messageId: msg.id, at: Date.now() });
 		this.emitRuntimeState();
 		let prepared: Awaited<ReturnType<AttachmentPipeline["prepare"]>> | undefined;
+		let delivery: QQOutboundDeliveryContext | undefined;
 		let ackTimer: ReturnType<typeof setTimeout> | undefined;
 		let ackCancelled = false;
 		const cancelProgressAck = (): void => {
@@ -293,7 +318,7 @@ export class PiQQBotRuntime {
 			else ackTimer = setTimeout(sendAck, delay);
 		}
 		try {
-			prepared = await this.attachmentPipeline.prepare(msg, this.runtimeAbort.signal, {
+			prepared = await this.attachmentPipeline.prepare(msg, runSignal, {
 				onStart: (index, total, attachmentKind, filename) => {
 					this.activeAttachmentStatus = `${attachmentKind} ${index}/${total}: ${filename}`;
 					this.emit({ kind: "attachment_start", messageId: msg.id, index, total, attachmentKind, filename, at: Date.now() });
@@ -338,26 +363,58 @@ export class PiQQBotRuntime {
 				return;
 			}
 
+			delivery = new QQOutboundDeliveryContext({
+				config: this.config,
+				cwd: this.agentCwd,
+				message: msg,
+				target,
+				api: this.api,
+				signal: runSignal,
+				fake: this.activeFake,
+				hasMessageSequenceCapacity: () => this.hasMediaReplyCapacity(msg.id),
+				reserveMessageSequence: () => this.reserveMediaReplySequence(msg.id),
+				onEvent: ({ stage, record }) => {
+					if (stage === "start") cancelProgressAck();
+					this.activeOutboundMediaStatus = stage === "sent" || stage === "failed"
+						? undefined
+						: `${stage}: ${record.filename}`;
+					if (stage === "failed") this.lastOutboundMediaError = `${record.errorCode ?? "outbound_failed"}: ${record.filename}`;
+					this.emit({
+						kind: stage === "start" ? "outbound_start" : stage === "uploaded" ? "outbound_uploaded" : stage === "sent" ? "outbound_sent" : "outbound_failed",
+						messageId: msg.id,
+						mediaKind: record.kind,
+						filename: record.filename,
+						bytes: record.bytes,
+						...(record.errorCode ? { errorCode: record.errorCode } : {}),
+						...(record.note ? { note: record.note } : {}),
+						at: Date.now(),
+					});
+				},
+			});
+			qq.bindOutboundDelivery(delivery);
 			const { text, tools } = await qq.run(withQQReplyGuidance(prepared.prompt), prepared.images, (event) =>
 				this.forwardAgentEvent(msg.id, event),
 			);
+			const deliverySummary = formatDeliverySummary(delivery.records);
+			const answer = [deliverySummary, text.trim()].filter(Boolean).join("\n\n");
 			const body = this.config.showProcess
-				? formatWithProcess(buildTranscript(tools), text)
-				: text;
+				? formatWithProcess(buildTranscript(tools), answer)
+				: answer;
 			cancelProgressAck();
+			const sentMedia = delivery.records.some((record) => record.status === "sent");
 			if (body.trim()) {
-				await this.deliverReply(target, body, this.activeFake);
-			} else {
-				this.debugLog("assistant produced no text; sending empty-result fallback");
+				await this.deliverReply(target, body, this.activeFake, undefined, sentMedia);
+			} else if (!sentMedia) {
+				this.debugLog("assistant produced no text or media; sending empty-result fallback");
 				await this.deliverReply(
 					target,
-					"本次没有生成可发送的文本结果。可以换个问法，或发送 /status 查看状态。",
+					"本次没有生成可发送的文本或文件结果。可以换个问法，或发送 /status 查看状态。",
 					this.activeFake,
 				);
 			}
 		} catch (err) {
 			cancelProgressAck();
-			if (!this.runtimeAbort.signal.aborted) {
+			if (!runSignal.aborted) {
 				this.lastError = `qq session run failed: ${err instanceof Error ? err.message : String(err)}`;
 				this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
 				this.debugLog(this.lastError);
@@ -372,11 +429,15 @@ export class PiQQBotRuntime {
 			}
 		} finally {
 			cancelProgressAck();
+			delivery?.close();
+			qq.bindOutboundDelivery(undefined);
 			await prepared?.cleanup().catch(() => undefined);
 			this.running = false;
 			this.activeTarget = undefined;
 			this.activeFake = false;
 			this.activeAttachmentStatus = undefined;
+			this.activeOutboundMediaStatus = undefined;
+			if (this.activeRunAbort === runAbort) this.activeRunAbort = undefined;
 			this.nextMsgSeq.delete(msg.id);
 			this.progressAckSent.delete(msg.id);
 			this.emit({ kind: "run_end", messageId: msg.id, at: Date.now() });
@@ -751,6 +812,7 @@ export class PiQQBotRuntime {
 		const qq = this.conversations?.peek(msg);
 		const removed = this.queue.removeWhere((queued) => conversationKey(queued) === conversationKey(msg));
 		const wasRunning = qq?.isStreaming() === true || (this.running && this.activeTarget && sameConversation(msg, this.activeTarget));
+		if (wasRunning) this.activeRunAbort?.abort(new Error("QQ task stopped"));
 		await qq?.abort();
 		await this.replyToQQ(
 			msg,
@@ -908,10 +970,12 @@ export class PiQQBotRuntime {
 		text: string,
 		fake: boolean,
 		keyboard?: QQKeyboard,
+		forcePlain = false,
 	): Promise<void> {
 		const full = (this.config.replyPrefix ?? "") + text;
-		const formatted = formatQQReply(full, this.config.replyFormat);
-		const chunks = this.config.replyFormat === "plain" ? formatted.plain : formatted.markdown;
+		const replyFormat = forcePlain ? "plain" : this.config.replyFormat;
+		const formatted = formatQQReply(full, replyFormat);
+		const chunks = replyFormat === "plain" ? formatted.plain : formatted.markdown;
 
 		this.lastOutbound = {
 			type: target.type,
@@ -937,7 +1001,7 @@ export class PiQQBotRuntime {
 				sentChunks: chunks.length,
 				at: Date.now(),
 			});
-			this.debugLog(`[fake] would send ${chunks.length} ${this.config.replyFormat === "plain" ? "plain" : "markdown"} chunk(s) to ${target.type}`);
+			this.debugLog(`[fake] would send ${chunks.length} ${replyFormat === "plain" ? "plain" : "markdown"} chunk(s) to ${target.type}`);
 			return;
 		}
 		if (!this.api) {
@@ -956,8 +1020,9 @@ export class PiQQBotRuntime {
 		let sentChunks = 0;
 		let nextMsgSeq = this.nextMsgSeq.get(target.msgId) ?? 1;
 		const usedBefore = nextMsgSeq - 1;
-		const maxChunks = Math.max(0, Math.min(chunks.length, QQ_MAX_REPLY_CHUNKS - usedBefore));
-		let useMarkdown = this.config.replyFormat !== "plain";
+		const remainingBudget = Math.max(0, QQ_MAX_REPLY_CHUNKS - usedBefore);
+		const maxChunks = Math.min(chunks.length, forcePlain ? Math.min(1, remainingBudget) : remainingBudget);
+		let useMarkdown = replyFormat !== "plain";
 		let delivery = useMarkdown ? "markdown" : "plain";
 		for (let i = 0; i < maxChunks; i++) {
 			try {
@@ -1027,6 +1092,18 @@ export class PiQQBotRuntime {
 		}
 	}
 
+	private hasMediaReplyCapacity(msgId: string): boolean {
+		return (this.nextMsgSeq.get(msgId) ?? 1) < QQ_MAX_REPLY_CHUNKS;
+	}
+
+	private reserveMediaReplySequence(msgId: string): number | undefined {
+		const next = this.nextMsgSeq.get(msgId) ?? 1;
+		// Keep at least one deterministic plain-text slot for the final acknowledgement.
+		if (next >= QQ_MAX_REPLY_CHUNKS) return undefined;
+		this.nextMsgSeq.set(msgId, next + 1);
+		return next;
+	}
+
 	private async sendBusyNotice(msg: QQInboundMessage): Promise<void> {
 		if (!this.api) return;
 		const target: QQReplyTarget = {
@@ -1082,13 +1159,16 @@ export class PiQQBotRuntime {
 			`process: ${this.config.showProcess ? "on" : "off"}`,
 			`progress ack: ${this.config.progress.enabled ? `on (${this.config.progress.ackAfterMs}ms)` : "off"}`,
 			`reply format: ${this.config.replyFormat}`,
-			`media: ${this.config.media.enabled ? "on" : "off"}`,
+			`media inbound: ${this.config.media.enabled ? "on" : "off"}`,
+			`media outbound: ${this.config.outboundMedia.enabled ? "on" : "off"}`,
 			`active: ${this.activeTargetLabel()}`,
 			`attachment: ${this.activeAttachmentStatus ?? "idle"}`,
+			`outbound media: ${this.activeOutboundMediaStatus ?? "idle"}`,
 			`last inbound: ${this.lastInbound ? new Date(this.lastInbound.at).toLocaleTimeString() : "none"}`,
 			`last outbound: ${this.lastOutbound ? new Date(this.lastOutbound.at).toLocaleTimeString() : "none"}`,
 		];
 		if (this.lastAttachmentError) lines.push(`last attachment error: ${this.lastAttachmentError}`);
+		if (this.lastOutboundMediaError) lines.push(`last outbound media error: ${this.lastOutboundMediaError}`);
 		if (this.lastError) lines.push(`last error: ${this.lastError}`);
 		return lines.join("\n");
 	}
@@ -1109,6 +1189,7 @@ export class PiQQBotRuntime {
 			);
 		}
 		if (this.lastAttachmentError) lines.push(`last attachment error: ${this.lastAttachmentError}`);
+		if (this.lastOutboundMediaError) lines.push(`last outbound media error: ${this.lastOutboundMediaError}`);
 		if (this.lastError) lines.push(`last error: ${this.lastError}`);
 		return lines.length ? lines.join("\n") : "no QQBot events yet";
 	}
@@ -1121,7 +1202,16 @@ export class PiQQBotRuntime {
 	}
 
 	private notify(text: string, level: "info" | "warning" | "error"): void {
-		if (this.ctx?.hasUI) this.ctx.ui.notify(text, level);
+		const ctx = this.ctx;
+		if (!ctx) return;
+		try {
+			// hasUI/ui getters assert that the extension session is still active.
+			// After /new, /resume, /fork, or /reload the cached ctx is stale and
+			// must not crash the process-level QQ gateway.
+			if (ctx.hasUI) ctx.ui.notify(text, level);
+		} catch {
+			this.ctx = undefined;
+		}
 	}
 
 	private emit(event: QQTerminalEvent): void {
@@ -1254,6 +1344,16 @@ function formatAttachmentFailures(resources: PreparedAttachment[]): string {
 		.join("\n");
 }
 
+function formatDeliverySummary(records: readonly QQOutboundDeliveryRecord[]): string {
+	if (!records.length) return "";
+	const lines = records.map((record) => {
+		if (record.status === "sent") return `- 已发送：${escapeMarkdownInline(record.filename)}`;
+		if (record.status === "unknown") return `- 发送结果未知：${escapeMarkdownInline(record.filename)}（${record.errorCode ?? "media_send_unknown"}）`;
+		return `- 未发送：${escapeMarkdownInline(record.filename)}（${record.errorCode ?? "outbound_failed"}）`;
+	});
+	return `**QQ 文件交付结果**\n\n${lines.join("\n")}`;
+}
+
 function maskOpenId(value: string): string {
 	if (value.length <= 12) return `${value.slice(0, 3)}…${value.slice(-3)}`;
 	return `${value.slice(0, 6)}…${value.slice(-6)}`;
@@ -1294,7 +1394,7 @@ class MessageDedupe {
 }
 
 function withQQReplyGuidance(prompt: string): string {
-	return `${prompt}\n\n<qq-reply-guidance>\n以下要求仅约束最终回答的呈现，不改变用户任务本身：请为手机 QQ 聊天界面组织最终回答，先直接给出答案或结论，删除寒暄和“好问题”等填充语；短回答不要强加标题；普通回答按“结论 → 关键点或步骤 → 必要注意事项”组织。每段只表达一个主题，段落简短；并列信息用无序列表，操作流程用有序列表，列表不要超过两层。仅对关键字使用粗体，风险或限制使用带文字标签的引用块（如“⚠️ 注意”）。避免宽表格，优先改成列表；代码仅保留必要、可复制的片段。不要添加“执行过程”章节，插件会在需要时附加执行摘要。输出 QQ 支持的简洁 Markdown，不要为了装饰堆叠标题、分割线或 Emoji。\n</qq-reply-guidance>`;
+	return `${prompt}\n\n<qq-outbound-media-guidance>\n当用户明确要求把电脑上的本地图片或文件发送、上传或传给当前 QQ 会话时，必须调用 qq_send_local_file；在最终文本中给出本地路径、Markdown 图片或 URL 不等于发送。只有工具返回 QQ API 已确认成功后，才能说文件已发送；工具失败时必须如实说明未发送。不要调用该工具来回答仅查看、分析或告知路径的请求。\n</qq-outbound-media-guidance>\n\n<qq-reply-guidance>\n以下要求仅约束最终回答的呈现，不改变用户任务本身：请为手机 QQ 聊天界面组织最终回答，先直接给出答案或结论，删除寒暄和“好问题”等填充语；短回答不要强加标题；普通回答按“结论 → 关键点或步骤 → 必要注意事项”组织。每段只表达一个主题，段落简短；并列信息用无序列表，操作流程用有序列表，列表不要超过两层。仅对关键字使用粗体，风险或限制使用带文字标签的引用块（如“⚠️ 注意”）。避免宽表格，优先改成列表；代码仅保留必要、可复制的片段。不要添加“执行过程”章节，插件会在需要时附加执行摘要。输出 QQ 支持的简洁 Markdown，不要为了装饰堆叠标题、分割线或 Emoji。\n</qq-reply-guidance>`;
 }
 
 function canFallbackFromMarkdown(err: QQApiError): boolean {

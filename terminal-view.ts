@@ -13,7 +13,7 @@ const MAX_ASSISTANT_CHARS = 8_000;
 const UI_THROTTLE_MS = 80;
 
 interface ViewLine {
-	kind: "inbound" | "queue" | "attachment" | "run" | "assistant" | "tool" | "reply" | "error";
+	kind: "inbound" | "queue" | "attachment" | "outbound" | "run" | "assistant" | "tool" | "reply" | "error";
 	text: string;
 	at: number;
 	messageId?: string;
@@ -76,8 +76,12 @@ export class TerminalConversationView implements QQConversationObserver {
 		this.disposed = true;
 		if (this.renderTimer) clearTimeout(this.renderTimer);
 		this.renderTimer = undefined;
-		this.ctx.ui.setWidget(WIDGET_KEY, undefined);
-		this.ctx.ui.setStatus(STATUS_KEY, undefined);
+		try {
+			this.ctx.ui.setWidget(WIDGET_KEY, undefined);
+			this.ctx.ui.setStatus(STATUS_KEY, undefined);
+		} catch {
+			// Session replacement can invalidate ctx before dispose finishes.
+		}
 		this.tui = undefined;
 		this.component = undefined;
 		this.lines.length = 0;
@@ -149,6 +153,38 @@ export class TerminalConversationView implements QQConversationObserver {
 					current.at = event.at;
 				} else {
 					this.push({ kind: "attachment", text, at: event.at, messageId: event.messageId, state: ok ? "success" : "error" });
+				}
+				break;
+			}
+			case "outbound_start":
+				this.push({
+					kind: "outbound",
+					text: `↑ ${event.mediaKind}  ${singleLine(event.filename)}  ${formatBytes(event.bytes)}  validating`,
+					at: event.at,
+					messageId: event.messageId,
+					state: "running",
+				});
+				break;
+			case "outbound_uploaded": {
+				const current = this.findLatest("outbound", event.messageId, "running");
+				if (current) {
+					current.text = `↑ ${event.mediaKind}  ${singleLine(event.filename)}  ${formatBytes(event.bytes)}  uploaded`;
+					current.at = event.at;
+				}
+				break;
+			}
+			case "outbound_sent":
+			case "outbound_failed": {
+				const current = this.findLatest("outbound", event.messageId, "running");
+				const ok = event.kind === "outbound_sent";
+				const suffix = ok ? "sent" : `${event.errorCode ?? "outbound_failed"}${event.note ? `  ${bounded(singleLine(event.note), 120)}` : ""}`;
+				const text = `${ok ? "✓" : "✗"} ${event.mediaKind}  ${singleLine(event.filename)}  ${formatBytes(event.bytes)}  ${suffix}`;
+				if (current) {
+					current.text = text;
+					current.state = ok ? "success" : "error";
+					current.at = event.at;
+				} else {
+					this.push({ kind: "outbound", text, at: event.at, messageId: event.messageId, state: ok ? "success" : "error" });
 				}
 				break;
 			}
@@ -345,7 +381,11 @@ export class TerminalConversationView implements QQConversationObserver {
 						? "warning"
 						: "dim";
 		const text = `QQBot ${icon} ${this.runtime.connection} | queue ${this.runtime.queueSize}${running}${active}${detail}`;
-		this.ctx.ui.setStatus(STATUS_KEY, this.ctx.ui.theme.fg(color, text));
+		try {
+			this.ctx.ui.setStatus(STATUS_KEY, this.ctx.ui.theme.fg(color, text));
+		} catch {
+			// Ignore stale UI contexts after local session replacement.
+		}
 	}
 }
 

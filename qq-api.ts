@@ -4,8 +4,8 @@
  * current documentation contains conflicting historical 4/5 reply limits.
  */
 
-import type { QQAuth } from "./qq-auth";
-import type { QQKeyboard, QQReplyTarget } from "./types";
+import type { QQAuth } from "./qq-auth.ts";
+import type { QQKeyboard, QQMediaUploadResult, QQReplyTarget } from "./types.ts";
 
 const PROD_BASE = "https://api.sgroup.qq.com";
 const SANDBOX_BASE = "https://sandbox.api.sgroup.qq.com";
@@ -56,13 +56,61 @@ export class QQApi {
 		});
 	}
 
-	private async send(target: QQReplyTarget, payload: Record<string, unknown>): Promise<void> {
+	/** Upload local bytes without sending an active/proactive QQ message. */
+	async uploadMedia(
+		target: QQReplyTarget,
+		fileType: 1 | 4,
+		fileData: string,
+		signal?: AbortSignal,
+		timeoutMs = 30_000,
+	): Promise<QQMediaUploadResult> {
+		const path = target.type === "private"
+			? `/v2/users/${encodeURIComponent(target.userOpenId)}/files`
+			: `/v2/groups/${encodeURIComponent(target.groupOpenId ?? "")}/files`;
+		const body = await this.postJson(path, {
+			file_type: fileType,
+			file_data: fileData,
+			srv_send_msg: false,
+		}, signal, timeoutMs, "media upload");
+		if (typeof body.file_info !== "string" || !body.file_info) {
+			throw new QQApiError("media upload response missing file_info", 502, undefined, true);
+		}
+		return {
+			fileInfo: body.file_info,
+			...(typeof body.file_uuid === "string" ? { fileUuid: body.file_uuid } : {}),
+			ttl: typeof body.ttl === "number" && Number.isFinite(body.ttl) ? body.ttl : 0,
+		};
+	}
+
+	/** Send previously uploaded media as a passive reply to the current QQ message. */
+	async sendMedia(target: QQReplyTarget, fileInfo: string, msgSeq: number, signal?: AbortSignal): Promise<void> {
+		await this.send(target, {
+			msg_type: 7,
+			media: { file_info: fileInfo },
+			msg_id: target.msgId,
+			msg_seq: msgSeq,
+			...(target.type === "group" ? { content: " " } : {}),
+		}, signal);
+	}
+
+	private async send(target: QQReplyTarget, payload: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
 		const path =
 			target.type === "private"
 				? `/v2/users/${encodeURIComponent(target.userOpenId)}/messages`
 				: `/v2/groups/${encodeURIComponent(target.groupOpenId ?? "")}/messages`;
-		const token = await this.auth.getToken();
+		await this.postJson(path, payload, signal, 10_000, "send");
+	}
 
+	private async postJson(
+		path: string,
+		payload: Record<string, unknown>,
+		signal: AbortSignal | undefined,
+		timeoutMs: number,
+		operation: string,
+	): Promise<Record<string, unknown>> {
+		const token = await this.auth.getToken();
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		let res: Response;
 		try {
 			res = await fetch(`${this.base}${path}`, {
@@ -72,28 +120,27 @@ export class QQApi {
 					Authorization: `QQBot ${token}`,
 				},
 				body: JSON.stringify(payload),
+				signal: requestSignal,
 			});
 		} catch (err) {
 			throw new QQApiError(
-				`send request failed: ${err instanceof Error ? err.message : String(err)}`,
+				`${operation} request failed: ${err instanceof Error ? err.message : String(err)}`,
 				0,
 			);
 		}
 
-		if (res.ok) return;
-
-		// Non-2xx: surface the platform error code/message without leaking secrets.
-		let code: number | undefined;
-		let message = "";
+		let body: Record<string, unknown> = {};
 		try {
-			const body = (await res.json()) as { code?: number; message?: string };
-			code = body.code;
-			message = body.message ?? "";
+			body = (await res.json()) as Record<string, unknown>;
 		} catch {
-			// ignore parse errors
+			// Successful sends may have no useful body; errors are still reported below.
 		}
+		if (res.ok) return body;
+
+		const code = typeof body.code === "number" ? body.code : undefined;
+		const message = typeof body.message === "string" ? body.message : "";
 		throw new QQApiError(
-			`send failed (status ${res.status}${code != null ? `, code ${code}` : ""})${message ? `: ${message}` : ""}`,
+			`${operation} failed (status ${res.status}${code != null ? `, code ${code}` : ""})${message ? `: ${message}` : ""}`,
 			res.status,
 			code,
 			true,
