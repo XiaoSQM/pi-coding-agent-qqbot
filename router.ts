@@ -3,9 +3,9 @@
  *
  * Responsibilities:
  *  - validate the allowlist for inbound messages
- *  - serialize QQ conversations through a single FIFO queue
- *  - run each message in the isolated QQ AgentSession
- *  - send the final assistant response back as a passive QQ reply
+ *  - serialize different QQ conversations through a FIFO queue
+ *  - steer new messages from the active conversation into its AgentSession run
+ *  - send the aggregate final assistant response back as a passive QQ reply
  *  - optionally mirror process-local events to the Pi TUI that ran /qqbot-start
  *
  * The observer is UI-only and optional. QQ handling never falls back to the
@@ -28,7 +28,7 @@ import { buildModelPage, formatModelPageFallback, type ModelPage } from "./model
 import { QQApi, QQApiError } from "./qq-api";
 import { QQAuth } from "./qq-auth";
 import { QQGateway } from "./qq-gateway";
-import { type QQAgentRunEvent, type QQAgentSession, type QQModelInfo, type QQSessionInfo, type QQToolCall, resolveSdkEntry } from "./qq-session";
+import { normalizeThinkingLevel, type QQAgentRunEvent, type QQAgentSession, type QQModelInfo, type QQSessionInfo, type QQToolCall, resolveSdkEntry } from "./qq-session";
 import { buildCommandKeyboard, type QQCommandButton } from "./qq-keyboard";
 import { MessageQueue } from "./queue";
 import { QQOutboundDeliveryContext } from "./outbound-media";
@@ -40,6 +40,7 @@ import type {
 	QQInboundMessage,
 	QQKeyboard,
 	PreparedAttachment,
+	PreparedQQMessage,
 	QQOutboundDeliveryRecord,
 	QQReplyTarget,
 	QQTerminalEvent,
@@ -67,6 +68,43 @@ interface OutboundSummary {
 	fake?: boolean;
 }
 
+interface ActiveConversationInput {
+	msg: QQInboundMessage;
+	target: QQReplyTarget;
+	pendingSlot: boolean;
+	pendingReleased: boolean;
+	prepared?: PreparedQQMessage;
+	delivery?: QQOutboundDeliveryContext;
+	ackTimer?: ReturnType<typeof setTimeout>;
+	ackCancelled: boolean;
+	cleaned: boolean;
+}
+
+interface ActiveConversationRun {
+	key: string;
+	qq: QQAgentSession;
+	rootMessageId: string;
+	abortController: AbortController;
+	signal: AbortSignal;
+	accepting: boolean;
+	stopped: boolean;
+	agentRunning: boolean;
+	pendingPreparations: number;
+	pendingCount: number;
+	prepareTail: Promise<void>;
+	ready: ActiveConversationInput[];
+	submitted: Map<string, ActiveConversationInput>;
+	submissionTasks: Set<Promise<void>>;
+	inputs: Set<ActiveConversationInput>;
+	deliveries: QQOutboundDeliveryContext[];
+	current?: ActiveConversationInput;
+	currentDelivery?: QQOutboundDeliveryContext;
+	finalText: string;
+	tools: QQToolCall[];
+	hadAgentRun: boolean;
+	wake?: () => void;
+}
+
 export class PiQQBotRuntime {
 	private config: PiQQBotConfig;
 
@@ -84,6 +122,8 @@ export class PiQQBotRuntime {
 
 	private ctx?: ExtensionContext;
 	private running = false;
+	private startingConversationKey?: string;
+	private activeConversation?: ActiveConversationRun;
 	private activeTarget?: QQReplyTarget;
 	private activeFake = false;
 
@@ -149,7 +189,7 @@ export class PiQQBotRuntime {
 	}
 
 	isIdle(): boolean {
-		return !this.running && this.queue.size === 0;
+		return !this.running && this.waitingMessageCount() === 0;
 	}
 
 	async waitForIdle(timeoutMs: number): Promise<boolean> {
@@ -204,6 +244,13 @@ export class PiQQBotRuntime {
 	}
 
 	async stop(): Promise<void> {
+		const active = this.activeConversation;
+		if (active) {
+			active.accepting = false;
+			active.stopped = true;
+			active.qq.clearPendingMessages();
+			this.notifyActiveChange(active);
+		}
 		this.runtimeAbort.abort(new Error("QQBot stopped"));
 		this.activeRunAbort?.abort(new Error("QQBot stopped"));
 		this.activeRunAbort = undefined;
@@ -216,6 +263,8 @@ export class PiQQBotRuntime {
 		this.conversations = undefined;
 		await conversations?.dispose();
 		this.queue.clear();
+		this.startingConversationKey = undefined;
+		this.activeConversation = undefined;
 		this.activeTarget = undefined;
 		this.activeFake = false;
 		this.activeAttachmentStatus = undefined;
@@ -269,184 +318,465 @@ export class PiQQBotRuntime {
 	// --- Agent run (isolated QQ session) ------------------------------------
 
 	private async runOne(msg: QQInboundMessage): Promise<void> {
+		const key = conversationKey(msg);
+		const runAbort = new AbortController();
+		this.running = true;
+		this.startingConversationKey = key;
+		this.activeRunAbort = runAbort;
+		this.activeTarget = replyTargetFor(msg);
+		this.activeFake = msg.fake === true;
+		this.emitRuntimeState();
+
 		let qq: QQAgentSession;
 		try {
 			if (!this.conversations) throw new Error("conversation registry not ready");
 			qq = await this.conversations.get(msg);
 		} catch (err) {
-			this.lastError = `qq session init failed: ${err instanceof Error ? err.message : String(err)}`;
-			this.emit({ kind: "error", messageId: msg.id, stage: "session init", message: this.lastError, at: Date.now() });
-			await this.replyToQQ(
-				msg,
-				`## QQ 会话不可用\n\n${formatUserFacingAgentError(err)}\n\n请稍后重试，或在主机查看 /qqbot-status。`,
-			).catch(() => undefined);
-			this.schedulePump();
+			if (!runAbort.signal.aborted && !this.runtimeAbort.signal.aborted) {
+				this.lastError = `qq session init failed: ${err instanceof Error ? err.message : String(err)}`;
+				this.emit({ kind: "error", messageId: msg.id, stage: "session init", message: this.lastError, at: Date.now() });
+				await this.replyToQQ(
+					msg,
+					`## QQ 会话不可用\n\n${formatUserFacingAgentError(err)}\n\n请稍后重试，或在主机查看 /qqbot-status。`,
+				).catch(() => undefined);
+			}
+			this.finishStartingRun(key, runAbort);
 			return;
 		}
-		this.running = true;
-		const target: QQReplyTarget = {
-			type: msg.type,
-			userOpenId: msg.userOpenId,
-			groupOpenId: msg.groupOpenId,
-			msgId: msg.id,
-			createdAt: Date.now(),
-		};
-		this.activeTarget = target;
-		this.activeFake = msg.fake === true;
-		const runAbort = new AbortController();
-		this.activeRunAbort = runAbort;
-		const runSignal = AbortSignal.any([this.runtimeAbort.signal, runAbort.signal]);
-		this.emit({ kind: "run_start", messageId: msg.id, at: Date.now() });
-		this.emitRuntimeState();
-		let prepared: Awaited<ReturnType<AttachmentPipeline["prepare"]>> | undefined;
-		let delivery: QQOutboundDeliveryContext | undefined;
-		let ackTimer: ReturnType<typeof setTimeout> | undefined;
-		let ackCancelled = false;
-		const cancelProgressAck = (): void => {
-			ackCancelled = true;
-			if (ackTimer) {
-				clearTimeout(ackTimer);
-				ackTimer = undefined;
-			}
-		};
-		if (this.config.progress.enabled && !msg.fake) {
-			const delay = this.config.progress.ackAfterMs;
-			const sendAck = () => {
-				if (!ackCancelled && this.running && this.activeTarget?.msgId === msg.id) void this.sendProgressAck(msg);
-			};
-			if (delay <= 0) sendAck();
-			else ackTimer = setTimeout(sendAck, delay);
+		if (runAbort.signal.aborted || this.runtimeAbort.signal.aborted) {
+			this.finishStartingRun(key, runAbort);
+			return;
 		}
+
+		this.startingConversationKey = undefined;
+		const active: ActiveConversationRun = {
+			key,
+			qq,
+			rootMessageId: msg.id,
+			abortController: runAbort,
+			signal: AbortSignal.any([this.runtimeAbort.signal, runAbort.signal]),
+			accepting: true,
+			stopped: false,
+			agentRunning: false,
+			pendingPreparations: 0,
+			pendingCount: 0,
+			prepareTail: Promise.resolve(),
+			ready: [],
+			submitted: new Map(),
+			submissionTasks: new Set(),
+			inputs: new Set(),
+			deliveries: [],
+			finalText: "",
+			tools: [],
+			hadAgentRun: false,
+		};
+		this.activeConversation = active;
+		this.emit({ kind: "run_start", messageId: msg.id, at: Date.now() });
+
+		this.admitActiveMessage(active, msg, false);
+		const alreadyQueued = this.queue.takeWhere((queued) => conversationKey(queued) === active.key);
+		for (const queued of alreadyQueued) this.admitActiveMessage(active, queued, true);
+		this.emitRuntimeState();
+
 		try {
-			prepared = await this.attachmentPipeline.prepare(msg, runSignal, {
-				onStart: (index, total, attachmentKind, filename) => {
-					this.activeAttachmentStatus = `${attachmentKind} ${index}/${total}: ${filename}`;
-					this.emit({ kind: "attachment_start", messageId: msg.id, index, total, attachmentKind, filename, at: Date.now() });
-				},
-				onProgress: (index, total, attachmentKind, filename, bytes) => {
-					this.emit({ kind: "attachment_progress", messageId: msg.id, index, total, attachmentKind, filename, bytes, at: Date.now() });
-				},
-				onEnd: (index, total, resource, bytes) => {
-					const note = resource.kind === "unsupported" ? resource.reason : resource.note;
-					if (resource.status !== "ready") {
-						this.lastAttachmentError = `${resource.errorCode ?? "attachment_failed"}: ${resource.filename}${note ? ` — ${note}` : ""}`;
-					}
-					this.emit({
-						kind: resource.status === "ready" ? "attachment_end" : "attachment_rejected",
-						messageId: msg.id,
-						index,
-						total,
-						attachmentKind: resource.kind,
-						filename: resource.filename,
-						status: resource.status,
-						bytes,
-						note,
-						at: Date.now(),
-					});
-				},
-			});
-			this.activeAttachmentStatus = undefined;
+			await this.runActiveConversation(active);
+			if (active.signal.aborted || !active.hadAgentRun || !active.current) return;
+			const finalInput = active.current;
 
-			const readyImages = prepared.resources.filter((resource) => resource.kind === "image" && resource.status === "ready");
-			if (readyImages.length && !qq.supportsImages()) {
-				const reply = msg.text.trim()
-					? "当前 QQ Agent 使用的模型不支持图片理解。我没有读取图片；请切换到支持视觉输入的模型后重试。你的文字内容也未提交，以避免产生误导性回答。"
-					: "当前 QQ Agent 使用的模型不支持图片理解，因此没有运行可能产生误导的模型回合。请切换到支持视觉输入的模型后重试。";
-				cancelProgressAck();
-				await this.deliverReply(target, reply, this.activeFake);
-				return;
-			}
-
-			if (!hasUsableAgentInput(msg, prepared.resources)) {
-				cancelProgressAck();
-				await this.deliverReply(target, formatAttachmentFailures(prepared.resources), this.activeFake);
-				return;
-			}
-
-			delivery = new QQOutboundDeliveryContext({
-				config: this.config,
-				cwd: this.agentCwd,
-				message: msg,
-				target,
-				api: this.api,
-				signal: runSignal,
-				fake: this.activeFake,
-				hasMessageSequenceCapacity: () => this.hasMediaReplyCapacity(msg.id),
-				reserveMessageSequence: () => this.reserveMediaReplySequence(msg.id),
-				onEvent: ({ stage, record }) => {
-					if (stage === "start") cancelProgressAck();
-					this.activeOutboundMediaStatus = stage === "sent" || stage === "failed"
-						? undefined
-						: `${stage}: ${record.filename}`;
-					if (stage === "failed") this.lastOutboundMediaError = `${record.errorCode ?? "outbound_failed"}: ${record.filename}`;
-					this.emit({
-						kind: stage === "start" ? "outbound_start" : stage === "uploaded" ? "outbound_uploaded" : stage === "sent" ? "outbound_sent" : "outbound_failed",
-						messageId: msg.id,
-						mediaKind: record.kind,
-						filename: record.filename,
-						bytes: record.bytes,
-						...(record.errorCode ? { errorCode: record.errorCode } : {}),
-						...(record.note ? { note: record.note } : {}),
-						at: Date.now(),
-					});
-				},
-			});
-			qq.bindOutboundDelivery(delivery);
-			const { text, tools } = await qq.run(withQQReplyGuidance(prepared.prompt), prepared.images, (event) =>
-				this.forwardAgentEvent(msg.id, event),
-			);
-			const deliverySummary = formatDeliverySummary(delivery.records);
-			const answer = [deliverySummary, text.trim()].filter(Boolean).join("\n\n");
+			for (const input of active.inputs) this.cancelInputProgressAck(input);
+			const records = active.deliveries.flatMap((delivery) => [...delivery.records]);
+			const deliverySummary = formatDeliverySummary(records);
+			const answer = [deliverySummary, active.finalText.trim()].filter(Boolean).join("\n\n");
 			const body = this.config.showProcess
-				? formatWithProcess(buildTranscript(tools), answer)
+				? formatWithProcess(buildTranscript(active.tools), answer)
 				: answer;
-			cancelProgressAck();
-			const sentMedia = delivery.records.some((record) => record.status === "sent");
+			const sentMedia = records.some((record) => record.status === "sent");
 			if (body.trim()) {
-				await this.deliverReply(target, body, this.activeFake, undefined, sentMedia);
+				await this.deliverReply(finalInput.target, body, finalInput.msg.fake === true, undefined, sentMedia);
 			} else if (!sentMedia) {
 				this.debugLog("assistant produced no text or media; sending empty-result fallback");
 				await this.deliverReply(
-					target,
+					finalInput.target,
 					"本次没有生成可发送的文本或文件结果。可以换个问法，或发送 /status 查看状态。",
-					this.activeFake,
+					finalInput.msg.fake === true,
 				);
 			}
 		} catch (err) {
-			cancelProgressAck();
-			if (!runSignal.aborted) {
+			for (const input of active.inputs) this.cancelInputProgressAck(input);
+			if (!active.signal.aborted) {
+				const failedInput = active.current ?? [...active.inputs].at(-1);
 				this.lastError = `qq session run failed: ${err instanceof Error ? err.message : String(err)}`;
-				this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
+				this.emit({ kind: "error", messageId: failedInput?.msg.id ?? msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
 				this.debugLog(this.lastError);
-				await this.deliverReply(
-					target,
-					`## 处理失败\n\n${formatUserFacingAgentError(err)}`,
-					this.activeFake,
-					this.commandKeyboard(msg, [[{ label: "当前状态", command: "/status", primary: true }, { label: "停止任务", command: "/stop" }]]),
-				).catch((sendErr) => {
-					this.debugLog(`failed to deliver error reply: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
-				});
+				if (failedInput) {
+					await this.deliverReply(
+						failedInput.target,
+						`## 处理失败\n\n${formatUserFacingAgentError(err)}`,
+						failedInput.msg.fake === true,
+						this.commandKeyboard(failedInput.msg, [[{ label: "当前状态", command: "/status", primary: true }, { label: "停止任务", command: "/stop" }]]),
+					).catch((sendErr) => {
+						this.debugLog(`failed to deliver error reply: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+					});
+				}
 			}
 		} finally {
-			cancelProgressAck();
-			delivery?.close();
+			active.accepting = false;
+			active.stopped = true;
+			active.qq.clearPendingMessages();
+			if (!runAbort.signal.aborted) runAbort.abort(new Error("QQ aggregate run finished"));
+			this.notifyActiveChange(active);
+			await active.prepareTail.catch(() => undefined);
+			await Promise.allSettled([...active.submissionTasks]);
+			for (const delivery of active.deliveries) delivery.close();
 			qq.bindOutboundDelivery(undefined);
-			await prepared?.cleanup().catch(() => undefined);
-			this.running = false;
-			this.activeTarget = undefined;
-			this.activeFake = false;
-			this.activeAttachmentStatus = undefined;
-			this.activeOutboundMediaStatus = undefined;
+			await Promise.allSettled([...active.inputs].map((input) => this.cleanupActiveInput(input)));
+			for (const input of active.inputs) {
+				this.cancelInputProgressAck(input);
+				this.nextMsgSeq.delete(input.msg.id);
+				this.progressAckSent.delete(input.msg.id);
+			}
+			if (this.activeConversation === active) {
+				this.activeConversation = undefined;
+				this.running = false;
+				this.activeTarget = undefined;
+				this.activeFake = false;
+				this.activeAttachmentStatus = undefined;
+				this.activeOutboundMediaStatus = undefined;
+			}
 			if (this.activeRunAbort === runAbort) this.activeRunAbort = undefined;
-			this.nextMsgSeq.delete(msg.id);
-			this.progressAckSent.delete(msg.id);
 			this.emit({ kind: "run_end", messageId: msg.id, at: Date.now() });
 			this.emitRuntimeState();
 			this.schedulePump();
 		}
 	}
 
-	private forwardAgentEvent(messageId: string, event: QQAgentRunEvent): void {
+	private finishStartingRun(key: string, runAbort: AbortController): void {
+		if (this.startingConversationKey === key) {
+			this.startingConversationKey = undefined;
+			this.running = false;
+			this.activeTarget = undefined;
+			this.activeFake = false;
+		}
+		if (this.activeRunAbort === runAbort) this.activeRunAbort = undefined;
+		this.emitRuntimeState();
+		this.schedulePump();
+	}
+
+	private admitActiveMessage(active: ActiveConversationRun, msg: QQInboundMessage, pendingSlot: boolean): ActiveConversationInput {
+		const input: ActiveConversationInput = {
+			msg,
+			target: replyTargetFor(msg),
+			pendingSlot,
+			pendingReleased: !pendingSlot,
+			ackCancelled: false,
+			cleaned: false,
+		};
+		active.inputs.add(input);
+		if (pendingSlot) active.pendingCount++;
+		this.startInputProgressAck(active, input);
+		active.pendingPreparations++;
+		const preparation = active.prepareTail
+			.then(() => this.prepareActiveInput(active, input))
+			.catch((err) => this.handleActiveInputPreparationError(active, input, err))
+			.finally(() => {
+				active.pendingPreparations = Math.max(0, active.pendingPreparations - 1);
+				this.activeAttachmentStatus = undefined;
+				this.notifyActiveChange(active);
+			});
+		active.prepareTail = preparation;
+		this.notifyActiveChange(active);
+		return input;
+	}
+
+	private async prepareActiveInput(active: ActiveConversationRun, input: ActiveConversationInput): Promise<void> {
+		if (active.stopped || active.signal.aborted) throw active.signal.reason ?? new Error("QQ task stopped");
+		const msg = input.msg;
+		const prepared = await this.attachmentPipeline.prepare(msg, active.signal, {
+			onStart: (index, total, attachmentKind, filename) => {
+				this.activeAttachmentStatus = `${attachmentKind} ${index}/${total}: ${filename}`;
+				this.emit({ kind: "attachment_start", messageId: msg.id, index, total, attachmentKind, filename, at: Date.now() });
+			},
+			onProgress: (index, total, attachmentKind, filename, bytes) => {
+				this.emit({ kind: "attachment_progress", messageId: msg.id, index, total, attachmentKind, filename, bytes, at: Date.now() });
+			},
+			onEnd: (index, total, resource, bytes) => {
+				const note = resource.kind === "unsupported" ? resource.reason : resource.note;
+				if (resource.status !== "ready") {
+					this.lastAttachmentError = `${resource.errorCode ?? "attachment_failed"}: ${resource.filename}${note ? ` — ${note}` : ""}`;
+				}
+				this.emit({
+					kind: resource.status === "ready" ? "attachment_end" : "attachment_rejected",
+					messageId: msg.id,
+					index,
+					total,
+					attachmentKind: resource.kind,
+					filename: resource.filename,
+					status: resource.status,
+					bytes,
+					note,
+					at: Date.now(),
+				});
+			},
+		});
+		input.prepared = prepared;
+		this.activeAttachmentStatus = undefined;
+		if (active.stopped || active.signal.aborted) {
+			this.releasePendingSlot(active, input);
+			await this.cleanupActiveInput(input);
+			return;
+		}
+
+		const readyImages = prepared.resources.filter((resource) => resource.kind === "image" && resource.status === "ready");
+		if (readyImages.length && !active.qq.supportsImages()) {
+			const reply = msg.text.trim()
+				? "当前 QQ Agent 使用的模型不支持图片理解。我没有读取图片；请切换到支持视觉输入的模型后重试。你的文字内容也未提交，以避免产生误导性回答。"
+				: "当前 QQ Agent 使用的模型不支持图片理解，因此没有运行可能产生误导的模型回合。请切换到支持视觉输入的模型后重试。";
+			await this.rejectPreparedInput(active, input, reply);
+			return;
+		}
+		if (!hasUsableAgentInput(msg, prepared.resources)) {
+			await this.rejectPreparedInput(active, input, formatAttachmentFailures(prepared.resources));
+			return;
+		}
+
+		active.ready.push(input);
+		this.flushReadyAsSteers(active);
+		this.notifyActiveChange(active);
+	}
+
+	private async handleActiveInputPreparationError(
+		active: ActiveConversationRun,
+		input: ActiveConversationInput,
+		err: unknown,
+	): Promise<void> {
+		this.cancelInputProgressAck(input);
+		this.releasePendingSlot(active, input);
+		if (!active.signal.aborted && !active.stopped) {
+			this.lastError = `attachment preparation failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.emit({ kind: "error", messageId: input.msg.id, stage: "attachment preparation", message: this.lastError, at: Date.now() });
+			this.debugLog(this.lastError);
+			await this.deliverReply(
+				input.target,
+				`## 处理失败\n\n${formatUserFacingAgentError(err)}`,
+				input.msg.fake === true,
+			).catch((sendErr) => {
+				this.debugLog(`failed to deliver attachment error: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+			});
+		}
+		await this.cleanupActiveInput(input);
+	}
+
+	private async rejectPreparedInput(active: ActiveConversationRun, input: ActiveConversationInput, reply: string): Promise<void> {
+		this.cancelInputProgressAck(input);
+		this.releasePendingSlot(active, input);
+		if (!active.signal.aborted && !active.stopped) {
+			await this.deliverReply(input.target, reply, input.msg.fake === true).catch((err) => {
+				this.debugLog(`failed to deliver rejected input: ${err instanceof Error ? err.message : String(err)}`);
+			});
+		}
+		await this.cleanupActiveInput(input);
+	}
+
+	private async runActiveConversation(active: ActiveConversationRun): Promise<void> {
+		while (!active.signal.aborted && !active.stopped) {
+			const input = active.ready.shift();
+			if (!input) {
+				if (active.pendingPreparations === 0 && active.submitted.size === 0 && active.submissionTasks.size === 0) {
+					active.accepting = false;
+					this.notifyActiveChange(active);
+					return;
+				}
+				await this.waitForActiveChange(active);
+				continue;
+			}
+
+			this.activateInput(active, input);
+			active.agentRunning = true;
+			active.hadAgentRun = true;
+			try {
+				const result = await active.qq.run(
+					withQQReplyGuidance(input.prepared?.prompt ?? ""),
+					input.prepared?.images ?? [],
+					(event) => this.forwardAgentEvent(active, event),
+				);
+				active.finalText = result.text;
+				active.tools.push(...result.tools);
+			} finally {
+				active.agentRunning = false;
+				if (active.submissionTasks.size) await Promise.allSettled([...active.submissionTasks]);
+				if (!active.signal.aborted && !active.stopped) {
+					// A steer can land after Pi's final queue poll but before isStreaming
+					// flips false. Such an input has no user_message event yet. Remove the
+					// orphaned native queue entry and run it as the next aggregate base.
+					if (active.submitted.size > 0 && active.qq.pendingMessageCount() > 0) {
+						active.qq.clearPendingMessages();
+						this.requeueSubmittedInputs(active);
+					} else {
+						this.reconcileSubmittedInputs(active);
+					}
+				} else {
+					active.submitted.clear();
+				}
+				this.notifyActiveChange(active);
+			}
+		}
+	}
+
+	private flushReadyAsSteers(active: ActiveConversationRun): void {
+		if (!active.agentRunning || !active.qq.isStreaming() || active.stopped || active.signal.aborted) return;
+		const ready = active.ready.splice(0);
+		for (const input of ready) this.submitSteeringInput(active, input);
+	}
+
+	private submitSteeringInput(active: ActiveConversationRun, input: ActiveConversationInput): void {
+		const prepared = input.prepared;
+		if (!prepared) return;
+		active.submitted.set(prepared.correlationId, input);
+		let task: Promise<void>;
+		task = active.qq.steer(withQQReplyGuidance(prepared.prompt), prepared.images)
+			.then(() => {
+				this.emit({ kind: "steered", messageId: input.msg.id, pending: this.waitingMessageCount(), at: Date.now() });
+			})
+			.catch(async (err) => {
+				if (!active.submitted.delete(prepared.correlationId)) return;
+				if (active.signal.aborted || active.stopped) {
+					this.releasePendingSlot(active, input);
+					await this.cleanupActiveInput(input);
+					return;
+				}
+				this.lastError = `steering submission failed: ${err instanceof Error ? err.message : String(err)}`;
+				this.emit({ kind: "error", messageId: input.msg.id, stage: "steering", message: this.lastError, at: Date.now() });
+				await this.rejectPreparedInput(
+					active,
+					input,
+					`## 插嘴消息未提交\n\n${formatUserFacingAgentError(err)}`,
+				);
+			})
+			.finally(() => {
+				active.submissionTasks.delete(task);
+				this.notifyActiveChange(active);
+			});
+		active.submissionTasks.add(task);
+	}
+
+	private requeueSubmittedInputs(active: ActiveConversationRun): void {
+		const late = [...active.submitted.values()];
+		active.submitted.clear();
+		active.ready.unshift(...late);
+	}
+
+	private reconcileSubmittedInputs(active: ActiveConversationRun): void {
+		for (const [correlationId, input] of active.submitted) {
+			active.submitted.delete(correlationId);
+			this.activateInput(active, input);
+		}
+	}
+
+	private activateInput(active: ActiveConversationRun, input: ActiveConversationInput): void {
+		if (active.current === input) {
+			this.releasePendingSlot(active, input);
+			return;
+		}
+		active.currentDelivery?.close();
+		active.current = input;
+		this.activeTarget = input.target;
+		this.activeFake = input.msg.fake === true;
+		const delivery = new QQOutboundDeliveryContext({
+			config: this.config,
+			cwd: this.agentCwd,
+			message: input.msg,
+			target: input.target,
+			api: this.api,
+			signal: active.signal,
+			fake: input.msg.fake === true,
+			hasMessageSequenceCapacity: () => this.hasMediaReplyCapacity(input.msg.id),
+			reserveMessageSequence: () => this.reserveMediaReplySequence(input.msg.id),
+			onEvent: ({ stage, record }) => {
+				if (stage === "start") this.cancelInputProgressAck(input);
+				this.activeOutboundMediaStatus = stage === "sent" || stage === "failed"
+					? undefined
+					: `${stage}: ${record.filename}`;
+				if (stage === "failed") this.lastOutboundMediaError = `${record.errorCode ?? "outbound_failed"}: ${record.filename}`;
+				this.emit({
+					kind: stage === "start" ? "outbound_start" : stage === "uploaded" ? "outbound_uploaded" : stage === "sent" ? "outbound_sent" : "outbound_failed",
+					messageId: input.msg.id,
+					mediaKind: record.kind,
+					filename: record.filename,
+					bytes: record.bytes,
+					...(record.errorCode ? { errorCode: record.errorCode } : {}),
+					...(record.note ? { note: record.note } : {}),
+					at: Date.now(),
+				});
+			},
+		});
+		input.delivery = delivery;
+		active.currentDelivery = delivery;
+		active.deliveries.push(delivery);
+		active.qq.bindOutboundDelivery(delivery);
+		this.releasePendingSlot(active, input);
+		this.emitRuntimeState();
+	}
+
+	private releasePendingSlot(active: ActiveConversationRun, input: ActiveConversationInput): void {
+		if (input.pendingReleased) return;
+		input.pendingReleased = true;
+		active.pendingCount = Math.max(0, active.pendingCount - 1);
+		this.notifyActiveChange(active);
+	}
+
+	private startInputProgressAck(active: ActiveConversationRun, input: ActiveConversationInput): void {
+		if (!this.config.progress.enabled || input.msg.fake) return;
+		const sendAck = () => {
+			if (!input.ackCancelled && !active.stopped && this.activeConversation === active && this.running) {
+				void this.sendProgressAck(input.msg);
+			}
+		};
+		if (this.config.progress.ackAfterMs <= 0) sendAck();
+		else input.ackTimer = setTimeout(sendAck, this.config.progress.ackAfterMs);
+	}
+
+	private cancelInputProgressAck(input: ActiveConversationInput): void {
+		input.ackCancelled = true;
+		if (input.ackTimer) clearTimeout(input.ackTimer);
+		input.ackTimer = undefined;
+	}
+
+	private async cleanupActiveInput(input: ActiveConversationInput): Promise<void> {
+		if (input.cleaned) return;
+		input.cleaned = true;
+		await input.prepared?.cleanup().catch(() => undefined);
+	}
+
+	private waitForActiveChange(active: ActiveConversationRun): Promise<void> {
+		return new Promise<void>((resolve) => {
+			active.wake = resolve;
+		});
+	}
+
+	private notifyActiveChange(active: ActiveConversationRun): void {
+		const wake = active.wake;
+		active.wake = undefined;
+		wake?.();
+		if (this.activeConversation === active) this.emitRuntimeState();
+	}
+
+	private forwardAgentEvent(active: ActiveConversationRun, event: QQAgentRunEvent): void {
+		if (event.kind === "agent_start") {
+			this.flushReadyAsSteers(active);
+			return;
+		}
+		if (event.kind === "user_message") {
+			const correlationId = extractQQCorrelationId(event.text);
+			const input = correlationId ? active.submitted.get(correlationId) : undefined;
+			if (input && correlationId) {
+				active.submitted.delete(correlationId);
+				this.activateInput(active, input);
+				this.notifyActiveChange(active);
+			}
+			return;
+		}
+
+		const messageId = active.current?.msg.id ?? active.rootMessageId;
 		const at = Date.now();
 		if (event.kind === "assistant_start") {
 			this.emit({ kind: "assistant_start", messageId, at });
@@ -544,20 +874,34 @@ export class PiQQBotRuntime {
 	}
 
 	private enqueuePrompt(msg: QQInboundMessage): void {
-		const accepted = this.queue.enqueue(msg);
-		if (!accepted) {
-			this.lastError = "queue full; message dropped";
-			this.emit({ kind: "error", messageId: msg.id, stage: "queue", message: this.lastError, at: Date.now() });
-			this.emitRuntimeState();
-			this.debugLog(this.lastError);
-			if (this.config.sendBusyNotice && !msg.fake) {
-				void this.sendBusyNotice(msg);
-			}
+		const active = this.activeConversation;
+		const canSteer = active?.accepting === true && !active.stopped && active.key === conversationKey(msg);
+		if (this.waitingMessageCount() >= (this.config.maxQueueSize ?? 20)) {
+			this.rejectPromptForCapacity(msg);
 			return;
 		}
-		this.emit({ kind: "queued", messageId: msg.id, queueSize: this.queue.size, at: Date.now() });
+		if (canSteer && active) {
+			this.admitActiveMessage(active, msg, true);
+			this.emit({ kind: "queued", messageId: msg.id, queueSize: this.waitingMessageCount(), at: Date.now() });
+			this.emitRuntimeState();
+			return;
+		}
+
+		if (!this.queue.enqueue(msg)) {
+			this.rejectPromptForCapacity(msg);
+			return;
+		}
+		this.emit({ kind: "queued", messageId: msg.id, queueSize: this.waitingMessageCount(), at: Date.now() });
 		this.emitRuntimeState();
 		this.schedulePump();
+	}
+
+	private rejectPromptForCapacity(msg: QQInboundMessage): void {
+		this.lastError = "queue full; message dropped";
+		this.emit({ kind: "error", messageId: msg.id, stage: "queue", message: this.lastError, at: Date.now() });
+		this.emitRuntimeState();
+		this.debugLog(this.lastError);
+		if (this.config.sendBusyNotice && !msg.fake) void this.sendBusyNotice(msg);
 	}
 
 	// --- QQ command control plane -----------------------------------------
@@ -636,7 +980,7 @@ export class PiQQBotRuntime {
 	private async handleModelCommand(msg: QQInboundMessage, query: string): Promise<void> {
 		const qq = await this.getConversation(msg);
 		const current = qq.currentModel();
-		const allModels = rankModels(qq.availableModels(), "");
+		const allModels = rankModels(await qq.availableModels(), "");
 		const tokens = query.trim().split(/\s+/).filter(Boolean);
 		let page = 1;
 		if (tokens.length >= 2 && /^page$/i.test(tokens.at(-2) ?? "") && /^\d+$/.test(tokens.at(-1) ?? "")) {
@@ -668,7 +1012,7 @@ export class PiQQBotRuntime {
 			if (!allModels[index]) throw new Error("模型序号无效或列表已变化；请重新发送 /model");
 			normalizedQuery = `${allModels[index].provider}/${allModels[index].id}`.toLowerCase();
 		}
-		const models = rankModels(qq.availableModels(), normalizedQuery);
+		const models = rankModels(allModels, normalizedQuery);
 		const exact = models.find((model) => `${model.provider}/${model.id}`.toLowerCase() === normalizedQuery);
 		const matches = exact ? [exact] : models.filter((model) => modelMatches(model, normalizedQuery));
 		if (!matches.length) throw new Error(`没有找到已配置认证且匹配“${query.trim()}”的模型`);
@@ -704,18 +1048,27 @@ export class PiQQBotRuntime {
 
 	private async handleThinkingCommand(msg: QQInboundMessage, requested?: string): Promise<void> {
 		const qq = await this.getConversation(msg);
+		const levels = qq.availableThinkingLevels();
 		if (!requested) {
 			await this.replyToQQ(
 				msg,
-				`## QQ 会话思考等级\n\n当前：**${qq.thinkingLevel()}**\n\n可选：${qq.availableThinkingLevels().map((level) => `\`${level}\``).join("、")}\n\n示例：\`/thinking high\``,
-				this.thinkingKeyboard(msg, qq.availableThinkingLevels()),
+				`## QQ 会话思考等级\n\n当前：**${qq.thinkingLevel()}**\n\n可选：${levels.map((level) => `\`${level}\``).join("、")}\n\n示例：\`/thinking high\``,
+				this.thinkingKeyboard(msg, levels),
 			);
 			return;
 		}
-		if (!qq.availableThinkingLevels().includes(requested.toLowerCase())) {
-			throw new Error(`当前模型不支持思考等级“${requested}”；可选：${qq.availableThinkingLevels().join("、")}`);
+
+		const normalized = normalizeThinkingLevel(requested);
+		const selected = levels.find((level) => level === normalized);
+		if (!selected) {
+			const suggestion = suggestThinkingLevel(normalized, levels);
+			throw new Error([
+				`思考等级“${requested}”无效`,
+				`当前模型可选：${levels.join("、")}`,
+				suggestion ? `你可能想输入：/thinking ${suggestion}` : "",
+			].filter(Boolean).join("；"));
 		}
-		const effective = qq.setThinkingLevel(requested.toLowerCase());
+		const effective = qq.setThinkingLevel(selected);
 		await this.replyToQQ(msg, `## 已更新 QQ 会话\n\n思考等级：**${effective}**`);
 	}
 
@@ -804,20 +1157,36 @@ export class PiQQBotRuntime {
 	}
 
 	private hasActiveOrQueuedConversation(msg: QQInboundMessage): boolean {
-		return (this.running && !!this.activeTarget && sameConversation(msg, this.activeTarget)) ||
-			this.queue.hasWhere((queued) => conversationKey(queued) === conversationKey(msg));
+		const key = conversationKey(msg);
+		return (this.running && (this.startingConversationKey === key || this.activeConversation?.key === key)) ||
+			this.queue.hasWhere((queued) => conversationKey(queued) === key);
 	}
 
 	private async handleStopCommand(msg: QQInboundMessage): Promise<void> {
-		const qq = this.conversations?.peek(msg);
-		const removed = this.queue.removeWhere((queued) => conversationKey(queued) === conversationKey(msg));
-		const wasRunning = qq?.isStreaming() === true || (this.running && this.activeTarget && sameConversation(msg, this.activeTarget));
-		if (wasRunning) this.activeRunAbort?.abort(new Error("QQ task stopped"));
-		await qq?.abort();
+		const key = conversationKey(msg);
+		const active = this.activeConversation?.key === key ? this.activeConversation : undefined;
+		const starting = this.running && this.startingConversationKey === key;
+		const qq = active?.qq ?? this.conversations?.peek(msg);
+		const removedFromQueue = this.queue.removeWhere((queued) => conversationKey(queued) === key);
+		const removedFromActive = active?.pendingCount ?? 0;
+		const wasRunning = !!active || starting || qq?.isStreaming() === true;
+		if (active) {
+			active.accepting = false;
+			active.stopped = true;
+			active.qq.clearPendingMessages();
+			active.abortController.abort(new Error("QQ task stopped"));
+			this.notifyActiveChange(active);
+		} else if (wasRunning) {
+			qq?.clearPendingMessages();
+			this.activeRunAbort?.abort(new Error("QQ task stopped"));
+		}
+		if (wasRunning) await qq?.abort();
+		const removed = removedFromQueue + removedFromActive;
+		this.emitRuntimeState();
 		await this.replyToQQ(
 			msg,
 			wasRunning || removed
-				? `## 已停止 QQ 任务\n\n${wasRunning ? "当前生成已中止。" : ""}${removed ? ` 已移除 ${removed} 条待处理消息。` : ""}\n\nQQ 会话历史已保留。`
+				? `## 已停止 QQ 任务\n\n${wasRunning ? "当前生成已中止。" : ""}${removed ? ` 已移除 ${removed} 条待处理或待插嘴消息。` : ""}\n\nQQ 会话历史已保留。`
 				: "当前 QQ 会话没有正在执行或等待的任务。",
 		);
 	}
@@ -826,7 +1195,7 @@ export class PiQQBotRuntime {
 		const detail = command?.toLowerCase();
 		const usages: Record<string, string> = {
 			model: "`/model` 查看当前和可用模型；`/model provider/model` 切换 QQ 会话模型。",
-			thinking: "`/thinking` 查看等级；`/thinking high` 修改 QQ 会话思考等级。",
+			thinking: "`/thinking` 查看当前模型支持的等级；例如 `/thinking high` 或 `/thinking xhigh` 修改 QQ 会话思考等级。等级名称需按列表准确输入。",
 			new: "`/new [名称]` 新建 QQ 会话。旧会话会保留；运行中请先 `/stop`。",
 			sessions: "`/sessions [关键词]` 查看或搜索当前 QQ 对话的历史会话。",
 			resume: "`/resume <短ID|唯一名称>` 恢复 QQ 会话。先用 `/sessions` 获取短 ID。",
@@ -862,8 +1231,8 @@ export class PiQQBotRuntime {
 			`- 会话：${qq.sessionName() ? `**${escapeMarkdownInline(qq.sessionName() ?? "")}**` : "未命名"} (\`${shortId(qq.sessionId())}\`)`,
 			`- 模型：\`${model ? `${model.provider}/${model.id}` : "unknown"}\``,
 			`- 思考：\`${qq.thinkingLevel()}\``,
-			`- 当前任务：${qq.isStreaming() ? "执行中" : "空闲"}`,
-			`- 等待消息：${this.queue.size}`,
+			`- 当前任务：${qq.isStreaming() || (this.running && (this.startingConversationKey === conversationKey(msg) || this.activeConversation?.key === conversationKey(msg))) ? "执行中" : "空闲"}`,
+			`- 等待消息：${this.waitingMessageCount()}`,
 			`- 历史模式：${this.config.sessions.mode === "persistent" ? "持久化" : "内存"}`,
 			`- 宿主：${this.config.startup.keepAcrossLocalSessions ? "本地会话切换保持" : "会话级"}`,
 		].join("\n");
@@ -1153,7 +1522,7 @@ export class PiQQBotRuntime {
 		const lines = [
 			`pi-qqbot: ${this.config.enabled ? "enabled" : "disabled"} (appId ${maskAppId(this.config.appId)}, ${this.config.sandbox ? "sandbox" : "prod"})`,
 			`connection: ${this.state}${this.stateDetail ? ` (${this.stateDetail})` : ""}`,
-			`queue: ${this.queue.size}`,
+			`queue: ${this.waitingMessageCount()}`,
 			`session: isolated (${this.conversations ? "ready" : "not ready"}, resident ${this.conversations?.residentCount ?? 0})`,
 			`commands: ${this.config.commands.enabled ? "on (SDK control)" : "off"}`,
 			`process: ${this.config.showProcess ? "on" : "off"}`,
@@ -1194,6 +1563,10 @@ export class PiQQBotRuntime {
 		return lines.length ? lines.join("\n") : "no QQBot events yet";
 	}
 
+	private waitingMessageCount(): number {
+		return this.queue.size + (this.activeConversation?.pendingCount ?? 0);
+	}
+
 	private activeTargetLabel(): string {
 		if (!this.activeTarget) return "none";
 		return this.activeTarget.type === "group"
@@ -1227,7 +1600,7 @@ export class PiQQBotRuntime {
 			kind: "runtime_state",
 			connection: this.state,
 			detail: this.stateDetail,
-			queueSize: this.queue.size,
+			queueSize: this.waitingMessageCount(),
 			running: this.running,
 			activeLabel: this.activeTarget
 				? this.activeTarget.type === "group"
@@ -1255,9 +1628,58 @@ export function isAllowed(config: PiQQBotConfig, msg: QQInboundMessage): boolean
 	return false;
 }
 
-function sameConversation(msg: QQInboundMessage, target: QQReplyTarget): boolean {
-	return msg.type === target.type &&
-		(msg.type === "private" ? msg.userOpenId === target.userOpenId : msg.groupOpenId === target.groupOpenId);
+function replyTargetFor(msg: QQInboundMessage): QQReplyTarget {
+	return {
+		type: msg.type,
+		userOpenId: msg.userOpenId,
+		groupOpenId: msg.groupOpenId,
+		msgId: msg.id,
+		createdAt: Date.now(),
+	};
+}
+
+function extractQQCorrelationId(text: string): string | undefined {
+	return text.match(/\[QQ [^\]\r\n]*\bref=([a-f0-9]{24})\]/i)?.[1]?.toLowerCase();
+}
+
+export function suggestThinkingLevel(input: string, levels: readonly string[]): string | undefined {
+	const normalizedInput = normalizeThinkingLevel(input);
+	if (!normalizedInput) return undefined;
+
+	let best: string | undefined;
+	let bestDistance = Number.POSITIVE_INFINITY;
+	let tied = false;
+	for (const level of levels) {
+		const candidate = normalizeThinkingLevel(level);
+		if (!candidate) continue;
+		const distance = thinkingLevelDistance(normalizedInput, candidate);
+		if (distance < bestDistance) {
+			best = candidate;
+			bestDistance = distance;
+			tied = false;
+		} else if (distance === bestDistance) {
+			tied = true;
+		}
+	}
+	if (!best || tied) return undefined;
+	const threshold = Math.max(1, Math.ceil(Math.max(normalizedInput.length, best.length) / 3));
+	return bestDistance <= threshold ? best : undefined;
+}
+
+function thinkingLevelDistance(left: string, right: string): number {
+	const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+	for (let leftIndex = 1; leftIndex <= left.length; leftIndex++) {
+		const current = [leftIndex];
+		for (let rightIndex = 1; rightIndex <= right.length; rightIndex++) {
+			current[rightIndex] = Math.min(
+				current[rightIndex - 1] + 1,
+				previous[rightIndex] + 1,
+				previous[rightIndex - 1] + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1),
+			);
+		}
+		for (let index = 0; index <= right.length; index++) previous[index] = current[index];
+	}
+	return previous[right.length] ?? left.length;
 }
 
 function modelMatches(model: QQModelInfo, query: string): boolean {

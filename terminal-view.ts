@@ -125,6 +125,17 @@ export class TerminalConversationView implements QQConversationObserver {
 				});
 				this.updateStatus();
 				break;
+			case "steered":
+				this.runtime.queueSize = event.pending;
+				this.push({
+					kind: "queue",
+					text: `↳ steering into active run (${event.pending} pending)`,
+					at: event.at,
+					messageId: event.messageId,
+					state: "success",
+				});
+				this.updateStatus();
+				break;
 			case "attachment_start":
 				this.push({
 					kind: "attachment",

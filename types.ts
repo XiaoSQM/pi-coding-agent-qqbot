@@ -187,6 +187,8 @@ export type PreparedAttachment =
 	  };
 
 export interface PreparedQQMessage {
+	/** Opaque marker embedded in prompt so delivered steering inputs can be correlated safely. */
+	correlationId: string;
 	prompt: string;
 	images: QQImageContent[];
 	resources: PreparedAttachment[];
@@ -276,6 +278,7 @@ export type QQTerminalEvent =
 			at: number;
 	  }
 	| { kind: "queued"; messageId: string; queueSize: number; at: number }
+	| { kind: "steered"; messageId: string; pending: number; at: number }
 	| {
 			kind: QQAttachmentEventKind;
 			messageId: string;

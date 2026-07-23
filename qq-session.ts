@@ -54,6 +54,8 @@ export interface QQSessionInfo {
 }
 
 export type QQAgentRunEvent =
+	| { kind: "agent_start" }
+	| { kind: "user_message"; text: string }
 	| { kind: "assistant_start" }
 	| { kind: "assistant_delta"; delta: string }
 	| { kind: "assistant_end" }
@@ -221,7 +223,11 @@ export class QQAgentSession {
 		};
 		// biome-ignore lint/suspicious/noExplicitAny: event union comes from the dynamic SDK.
 		const unsubscribe: () => void = session.subscribe((event: any) => {
-			if (event?.type === "message_update" && event.assistantMessageEvent?.type === "text_start") {
+			if (event?.type === "agent_start") {
+				emit({ kind: "agent_start" });
+			} else if (event?.type === "message_start" && event.message?.role === "user") {
+				emit({ kind: "user_message", text: userMessageText(event.message) });
+			} else if (event?.type === "message_update" && event.assistantMessageEvent?.type === "text_start") {
 				emit({ kind: "assistant_start" });
 			} else if (event?.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
 				const delta = event.assistantMessageEvent.delta;
@@ -252,19 +258,42 @@ export class QQAgentSession {
 		return { text: extractFinalAssistantText(messages), tools };
 	}
 
+	/** Queue a native Pi steering input into the currently streaming run. */
+	async steer(prompt: string, images: QQImageContent[] = []): Promise<void> {
+		const session = this.requireSession();
+		if (session.isStreaming !== true) throw new Error("QQ Agent is no longer streaming");
+		await session.steer(prompt, images);
+	}
+
+	/** Clear native steering/follow-up queues. Returns the number removed. */
+	clearPendingMessages(): number {
+		const session = this.runtime?.session;
+		if (!session) return 0;
+		const pending = typeof session.pendingMessageCount === "number" ? session.pendingMessageCount : 0;
+		session.clearQueue?.();
+		return pending;
+	}
+
+	pendingMessageCount(): number {
+		const count = this.runtime?.session?.pendingMessageCount;
+		return typeof count === "number" ? count : 0;
+	}
+
 	currentModel(): QQModelInfo | undefined {
 		return toModelInfo(this.runtime?.session?.model);
 	}
 
-	availableModels(): QQModelInfo[] {
-		const models = this.runtime?.services?.modelRegistry?.getAvailable?.();
-		return Array.isArray(models) ? models.map(toModelInfo).filter((value): value is QQModelInfo => !!value) : [];
+	async availableModels(): Promise<QQModelInfo[]> {
+		const models = await this.getAvailableModelEntries();
+		return models.map(toModelInfo).filter((value): value is QQModelInfo => !!value);
 	}
 
 	async setModel(provider: string, modelId: string): Promise<QQModelInfo> {
-		const registry = this.runtime?.services?.modelRegistry;
-		const model = registry?.find?.(provider, modelId);
-		if (!model || !registry.getAvailable().some((available: { provider: string; id: string }) => available.provider === provider && available.id === modelId)) {
+		const model = (await this.getAvailableModelEntries()).find((available) => {
+			const info = toModelInfo(available);
+			return info?.provider === provider && info.id === modelId;
+		});
+		if (!model) {
 			throw new Error(`模型不存在或当前未配置认证：${provider}/${modelId}`);
 		}
 		await this.requireSession().setModel(model);
@@ -279,13 +308,23 @@ export class QQAgentSession {
 
 	availableThinkingLevels(): string[] {
 		const levels = this.runtime?.session?.getAvailableThinkingLevels?.();
-		return Array.isArray(levels) ? levels : ["off"];
+		if (!Array.isArray(levels)) return ["off"];
+		const normalized = [...new Set(
+			levels
+				.filter((level): level is string => typeof level === "string")
+				.map(normalizeThinkingLevel)
+				.filter(Boolean),
+		)];
+		return normalized.length ? normalized : ["off"];
 	}
 
 	setThinkingLevel(level: string): string {
-		const allowed = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
-		if (!allowed.has(level)) throw new Error(`无效思考等级：${level}`);
-		this.requireSession().setThinkingLevel(level);
+		const normalized = normalizeThinkingLevel(level);
+		const available = this.availableThinkingLevels();
+		if (!available.includes(normalized)) {
+			throw new Error(`当前模型不支持思考等级“${level}”；可选：${available.join("、")}`);
+		}
+		this.requireSession().setThinkingLevel(normalized);
 		return this.thinkingLevel();
 	}
 
@@ -418,6 +457,19 @@ export class QQAgentSession {
 	private assertIdle(action: string): void {
 		if (this.isStreaming()) throw new Error(`当前 QQ 任务仍在执行，无法${action}；请先发送 /stop`);
 	}
+
+	private async getAvailableModelEntries(): Promise<unknown[]> {
+		const services = this.runtime?.services;
+		const modelRuntime = services?.modelRuntime;
+		const modelRegistry = services?.modelRegistry;
+		// New SDK services expose ModelRuntime; keep the registry fallback for older SDKs.
+		const models = typeof modelRuntime?.getAvailable === "function"
+			? await modelRuntime.getAvailable()
+			: typeof modelRegistry?.getAvailable === "function"
+				? await modelRegistry.getAvailable()
+				: [];
+		return Array.isArray(models) ? models : [];
+	}
 }
 
 function toModelInfo(value: unknown): QQModelInfo | undefined {
@@ -439,9 +491,25 @@ function toModelInfo(value: unknown): QQModelInfo | undefined {
 	};
 }
 
+export function normalizeThinkingLevel(value: string): string {
+	return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 function normalizeSessionName(value: string | undefined): string | undefined {
 	const normalized = value?.replace(/[\u0000-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
 	return normalized ? normalized.slice(0, 80) : undefined;
+}
+
+function userMessageText(message: unknown): string {
+	if (!message || typeof message !== "object") return "";
+	const content = (message as { content?: unknown }).content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type: "text"; text: string } =>
+			!!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string",
+		)
+		.map((part) => part.text)
+		.join("\n");
 }
 
 /** Settings exclusions that prevent auto-discovery from enabling pi-qqbot again. */

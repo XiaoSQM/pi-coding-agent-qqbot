@@ -1,9 +1,9 @@
 /**
- * FIFO queue that serializes complete inbound QQ messages.
+ * FIFO queue for conversations that are not currently active.
  *
- * Pi has a single active session, so QQ conversations are processed one at a
- * time to avoid overlapping turns and misdirected replies. When the queue is
- * full, the newest message is dropped (the caller may send a busy notice).
+ * The router may extract messages belonging to its active QQ conversation and
+ * feed them into Pi's steering queue. All other conversations preserve FIFO
+ * order. When the queue is full, the newest message is dropped.
  */
 
 import type { QQInboundMessage } from "./types";
@@ -42,13 +42,19 @@ export class MessageQueue {
 		return this.pending.some(predicate);
 	}
 
-	removeWhere(predicate: (msg: QQInboundMessage) => boolean): number {
-		let removed = 0;
-		for (let index = this.pending.length - 1; index >= 0; index--) {
-			if (!predicate(this.pending[index])) continue;
-			this.pending.splice(index, 1);
-			removed++;
+	/** Remove and return matching messages without changing the order of either partition. */
+	takeWhere(predicate: (msg: QQInboundMessage) => boolean): QQInboundMessage[] {
+		const taken: QQInboundMessage[] = [];
+		const retained: QQInboundMessage[] = [];
+		for (const msg of this.pending) {
+			(predicate(msg) ? taken : retained).push(msg);
 		}
-		return removed;
+		this.pending.length = 0;
+		this.pending.push(...retained);
+		return taken;
+	}
+
+	removeWhere(predicate: (msg: QQInboundMessage) => boolean): number {
+		return this.takeWhere(predicate).length;
 	}
 }
